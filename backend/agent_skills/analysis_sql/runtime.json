@@ -1,0 +1,25 @@
+{
+  "enabled": true,
+  "always_on": false,
+  "tools": [
+    "ckan__aggregate_data",
+    "ckan__execute_sql",
+    "ckan__query_data",
+    "ckan__get_schema",
+    "get_data"
+  ],
+  "trigger_keywords": [
+    "sql",
+    "query",
+    "aggregate",
+    "group by",
+    "trend",
+    "count",
+    "average",
+    "sum",
+    "compare",
+    "nyc",
+    "new york",
+    "socrata"
+  ]
+}

@@ -1,0 +1,215 @@
+# OpenContext Federated Dashboard - Colab Flow (Sanitized Template)
+
+# Cell 0: Prepare runtime copy
+SRC = "/content/drive/MyDrive/path/to/opencontext-federated-dashboard"
+%cd /content
+!rm -rf opencontext-dashboard_run
+!cp -r "$SRC" opencontext-dashboard_run
+%cd opencontext-dashboard_run
+
+# Cell 1: Config (fill these in)
+DASHBOARD_RUN = "/content/opencontext-dashboard_run"
+
+NGROK_AUTHTOKEN = ""      # required for tunnels
+ANTHROPIC_API_KEY = ""    # optional for live connector chat
+
+# Reserved ngrok domains (no https:// prefix)
+MCP_GATEWAY_HOSTNAME = "your-mcp-gateway.ngrok.dev"
+BACKEND_HOSTNAME = "your-backend.ngrok.dev"
+FRONTEND_HOSTNAME = "your-frontend.ngrok.dev"
+
+# Cell 1a: Backend/runtime environment
+import os
+import json
+
+os.environ["AGENT_RUNTIME_PRIMARY"] = "agent_sdk"
+os.environ["AGENT_SDK_NATIVE_SKILLS_ENABLED"] = "true"
+os.environ["AGENT_SDK_PERMISSION_MODE"] = "default"
+os.environ["AGENT_SDK_SETTING_SOURCES"] = "project"
+os.environ["AGENT_SDK_AUTO_APPROVE_BUILTINS_ENABLED"] = "true"
+os.environ["AGENT_SDK_AUTO_APPROVE_BUILTINS"] = ",".join([
+    "ToolSearch","AskUserQuestion","WebFetch","WebSearch","TodoWrite","NotebookEdit",
+    "TaskOutput","TaskStop","CronCreate","CronDelete","CronList",
+    "EnterPlanMode","ExitPlanMode","EnterWorktree",
+    "Bash","Read","Write","Edit","Glob","Grep","Skill","Agent"
+])
+os.environ["AGENT_SDK_DISALLOWED_TOOLS"] = ""
+
+os.environ["MCP_DEFAULT_SERVER_AUTO_REGISTER"] = "true"
+os.environ["MCP_DEFAULT_SERVERS_JSON"] = json.dumps([
+    {
+        "name": "opencontext-main",
+        "endpoint": f"https://{MCP_GATEWAY_HOSTNAME}/opencontext/mcp",
+        "description": "OpenContext via gateway",
+        "enabled": True,
+    },
+    {
+        "name": "nyc-opengov",
+        "endpoint": f"https://{MCP_GATEWAY_HOSTNAME}/opengov/mcp",
+        "description": "Socrata NYC via gateway",
+        "enabled": True,
+    },
+    {
+        "name": "nys-opengov",
+        "endpoint": f"https://{MCP_GATEWAY_HOSTNAME}/opengov-nys/mcp",
+        "description": "Socrata NYS via gateway",
+        "enabled": True,
+    },
+])
+
+# Cell 2: System dependencies
+%%bash
+set -euo pipefail
+apt-get update -y
+apt-get install -y rsync patch
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs
+node -v
+npm -v
+
+# Cell 3: Python deps + ngrok init
+!pip -q install pyngrok mcp-http-bridge
+from pyngrok import ngrok
+ngrok.set_auth_token(NGROK_AUTHTOKEN)
+ngrok.kill()
+print("ngrok reset complete")
+
+# Cell 4: Start OpenContext MCP server
+%%bash
+set -euo pipefail
+test -d /content/OpenContext || git clone https://github.com/CityOfBoston/OpenContext.git /content/OpenContext
+cd /content/OpenContext
+nohup python scripts/local_server.py > /content/opencontext.log 2>&1 &
+sleep 4
+tail -n 40 /content/opencontext.log || true
+
+# Cell 5: Verify OpenContext local MCP
+%%bash
+set -euo pipefail
+curl -sS -X POST http://127.0.0.1:8000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":"1","method":"ping","params":{}}' | python -m json.tool
+
+# Cell 6: Start OpenGov bridge (NYC) on 8100
+%%bash
+set -euo pipefail
+cat >/content/opengov-bridge.json <<'JSON'
+{
+  "server": {
+    "command": "npx",
+    "args": ["-y", "opengov-mcp-server@latest"],
+    "env": {
+      "DATA_PORTAL_URL": "https://data.cityofnewyork.us"
+    }
+  }
+}
+JSON
+nohup python -m mcp_http_bridge.main \
+  --config /content/opengov-bridge.json \
+  --host 0.0.0.0 \
+  --port 8100 \
+  --path /mcp > /content/opengov-bridge.log 2>&1 &
+
+# Cell 7: Start OpenGov bridge (NYS) on 8101
+%%bash
+set -euo pipefail
+cat >/content/opengov-nys-bridge.json <<'JSON'
+{
+  "server": {
+    "command": "npx",
+    "args": ["-y", "opengov-mcp-server@latest"],
+    "env": {
+      "DATA_PORTAL_URL": "https://data.ny.gov"
+    }
+  }
+}
+JSON
+nohup python -m mcp_http_bridge.main \
+  --config /content/opengov-nys-bridge.json \
+  --host 0.0.0.0 \
+  --port 8101 \
+  --path /mcp > /content/opengov-nys-bridge.log 2>&1 &
+
+# Cell 8: Start local MCP path gateway on 8200
+%%bash
+set -euo pipefail
+cd /content/opencontext-dashboard_run/backend
+export MCP_OPENCONTEXT_URL="http://127.0.0.1:8000/mcp"
+export MCP_OPENGOV_URL="http://127.0.0.1:8100/mcp"
+export MCP_OPENGOV_NYS_URL="http://127.0.0.1:8101/mcp"
+export MCP_GATEWAY_HOST="0.0.0.0"
+export MCP_GATEWAY_PORT="8200"
+nohup python tools/mcp_path_gateway.py > /content/mcp-gateway.log 2>&1 &
+sleep 3
+curl -sS http://127.0.0.1:8200/_gateway/health | python -m json.tool
+
+# Cell 9: Expose gateway and verify MCP paths
+from pyngrok import ngrok
+import requests
+
+mcp_gateway_tunnel = ngrok.connect(addr="8200", proto="http", hostname=MCP_GATEWAY_HOSTNAME)
+MCP_GATEWAY_URL = mcp_gateway_tunnel.public_url
+OPENCONTEXT_MCP_URL = f"{MCP_GATEWAY_URL}/opencontext/mcp"
+OPENGOV_MCP_URL = f"{MCP_GATEWAY_URL}/opengov/mcp"
+OPENGOV_NYS_MCP_URL = f"{MCP_GATEWAY_URL}/opengov-nys/mcp"
+print("MCP_GATEWAY_URL:", MCP_GATEWAY_URL)
+
+headers = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}
+ping_payload = {"jsonrpc": "2.0", "id": "1", "method": "ping", "params": {}}
+init_payload = {
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-03-26",
+        "clientInfo": {"name": "colab-check", "version": "0.1.0"},
+        "capabilities": {"tools": {}},
+    },
+}
+print("opencontext:", requests.post(OPENCONTEXT_MCP_URL, json=ping_payload, headers=headers, timeout=20).status_code)
+print("opengov:", requests.post(OPENGOV_MCP_URL, json=init_payload, headers=headers, timeout=20).status_code)
+print("opengov-nys:", requests.post(OPENGOV_NYS_MCP_URL, json=init_payload, headers=headers, timeout=20).status_code)
+
+# Cell 10: Start backend
+%%bash
+set -euo pipefail
+cd /content/opencontext-dashboard_run/backend
+python -m pip install -q -r requirements.txt
+if [ -f requirements-dev.txt ]; then python -m pip install -q -r requirements-dev.txt; fi
+export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"
+export BACKEND_HOST="0.0.0.0"
+export BACKEND_PORT="5100"
+nohup python app.py > /content/backend.log 2>&1 &
+sleep 3
+curl -sS http://127.0.0.1:5100/health | python -m json.tool
+
+# Cell 11: Expose backend
+from pyngrok import ngrok
+backend_tunnel = ngrok.connect(addr="5100", proto="http", hostname=BACKEND_HOSTNAME)
+BACKEND_URL = backend_tunnel.public_url
+print("BACKEND_URL:", BACKEND_URL)
+
+# Cell 12: Start frontend
+%%bash
+set -euo pipefail
+cd /content/opencontext-dashboard_run/frontend
+cat > .env.local <<EOF
+VITE_API_BASE_URL=https://your-backend.ngrok.dev
+EOF
+npm install
+nohup node ./node_modules/vite/bin/vite.js --host 0.0.0.0 --port 3000 > /content/frontend.log 2>&1 &
+sleep 3
+tail -n 30 /content/frontend.log
+
+# Cell 13: Expose frontend
+from pyngrok import ngrok
+frontend_tunnel = ngrok.connect(addr="3000", proto="http", hostname=FRONTEND_HOSTNAME)
+FRONTEND_URL = frontend_tunnel.public_url
+print("FRONTEND_URL:", FRONTEND_URL)
+print("Tunnels:", [t.public_url for t in ngrok.get_tunnels()])
+
+# Note: 3-endpoint-safe mode
+# 1) MCP gateway, 2) Backend, 3) Frontend

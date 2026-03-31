@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "always_on": false,
+  "tools": [
+    "create_visualization",
+    "ckan__aggregate_data",
+    "ckan__query_data",
+    "ckan__execute_sql",
+    "get_data"
+  ],
+  "trigger_keywords": [
+    "visualization",
+    "visualize",
+    "chart",
+    "graph",
+    "dashboard",
+    "plot",
+    "map",
+    "heatmap",
+    "geospatial",
+    "trend chart",
+    "kpi chart",
+    "canvas",
+    "show chart"
+  ]
+}

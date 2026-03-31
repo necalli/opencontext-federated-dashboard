@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "always_on": false,
+  "tools": [
+    "ckan__get_schema",
+    "ckan__query_data",
+    "ckan__get_dataset",
+    "get_data"
+  ],
+  "trigger_keywords": [
+    "schema",
+    "field",
+    "column",
+    "resource",
+    "data dictionary",
+    "metadata",
+    "type",
+    "nyc",
+    "new york",
+    "socrata"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "enabled": true,
+  "always_on": false,
+  "tools": [
+    "ckan__search_datasets",
+    "ckan__get_dataset",
+    "get_data"
+  ],
+  "trigger_keywords": [
+    "dataset",
+    "datasets",
+    "search",
+    "discover",
+    "find data",
+    "open data",
+    "public safety",
+    "finance",
+    "housing",
+    "transportation",
+    "nyc",
+    "new york",
+    "socrata"
+  ]
+}
