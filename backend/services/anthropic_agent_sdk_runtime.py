@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import inspect
 import json
 import os
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -129,6 +130,10 @@ class AnthropicAgentSDKRuntime:
         )
         self.auto_approve_builtins = _parse_csv(os.getenv("AGENT_SDK_AUTO_APPROVE_BUILTINS", ""))
         self.auto_approve_tools_extra = _parse_csv(os.getenv("AGENT_SDK_AUTO_APPROVE_TOOLS", ""))
+        self.duplicate_tool_alias_enabled = _to_bool(
+            os.getenv("AGENT_SDK_DUPLICATE_TOOL_ALIAS_ENABLED", "true"),
+            True,
+        )
         disallowed_default = (
             "ToolSearch,AskUserQuestion,WebFetch,WebSearch,TodoWrite,NotebookEdit,"
             "TaskOutput,TaskStop,CronCreate,CronDelete,CronList,EnterPlanMode,"
@@ -191,7 +196,7 @@ class AnthropicAgentSDKRuntime:
         visualization_requested = self._is_visualization_request(prompt)
 
         catalog = self.tool_router.build_catalog(active_servers)
-        available_tools = self._catalog_tools_by_name(catalog.tools, allowed_patterns)
+        available_tools = self._catalog_tools_for_sdk(catalog.tools, allowed_patterns)
         if not available_tools:
             raise AgentSDKRuntimeError(
                 "no_tools",
@@ -224,7 +229,9 @@ class AnthropicAgentSDKRuntime:
             viz_allowed_name = f"mcp__{self.server_alias}__create_visualization"
             if viz_allowed_name not in allowed_tool_names:
                 allowed_tool_names.append(viz_allowed_name)
-            internal_to_allowed["create_visualization"] = viz_allowed_name
+            internal_to_allowed.setdefault("create_visualization", [])
+            if viz_allowed_name not in internal_to_allowed["create_visualization"]:
+                internal_to_allowed["create_visualization"].append(viz_allowed_name)
 
         subagents = self._build_subagents(
             selected_skills=selected_skills,
@@ -345,12 +352,12 @@ class AnthropicAgentSDKRuntime:
             "sdk_meta": sdk_meta,
         }
 
-    def _catalog_tools_by_name(
+    def _catalog_tools_for_sdk(
         self,
         tools: List[Dict[str, Any]],
         allowed_patterns: List[str],
-    ) -> Dict[str, Dict[str, Any]]:
-        output: Dict[str, Dict[str, Any]] = {}
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
         for item in tools:
             if not isinstance(item, dict):
                 continue
@@ -359,28 +366,89 @@ class AnthropicAgentSDKRuntime:
                 continue
             if allowed_patterns and not tool_allowed(tool_name, allowed_patterns):
                 continue
-            if tool_name not in output:
-                output[tool_name] = item
+            normalized.append(
+                {
+                    "sdk_name": tool_name,
+                    "internal_tool_name": tool_name,
+                    "server_id": str(item.get("server_id") or "").strip(),
+                    "server_name": str(item.get("server_name") or "").strip(),
+                    "description": str(item.get("description") or "").strip(),
+                    "input_schema": item.get("input_schema") if isinstance(item.get("input_schema"), dict) else {},
+                }
+            )
+
+        if not self.duplicate_tool_alias_enabled:
+            deduped: Dict[str, Dict[str, Any]] = {}
+            for row in normalized:
+                tool_name = str(row.get("internal_tool_name") or "").strip()
+                if tool_name and tool_name not in deduped:
+                    deduped[tool_name] = row
+            return list(deduped.values())
+
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in normalized:
+            tool_name = str(row.get("internal_tool_name") or "").strip()
+            if not tool_name:
+                continue
+            grouped.setdefault(tool_name, []).append(row)
+
+        output: List[Dict[str, Any]] = []
+        for tool_name in sorted(grouped.keys()):
+            group = grouped.get(tool_name) or []
+            if len(group) <= 1:
+                if group:
+                    output.append(group[0])
+                continue
+
+            used_sdk_names: set[str] = set()
+            for index, row in enumerate(group, start=1):
+                server_hint = (
+                    str(row.get("server_name") or "").strip()
+                    or str(row.get("server_id") or "").strip()
+                    or f"server_{index}"
+                )
+                slug = re.sub(r"[^a-z0-9]+", "_", server_hint.lower()).strip("_")
+                if not slug:
+                    slug = f"server_{index}"
+                slug = slug[:48]
+
+                sdk_name = f"{tool_name}__{slug}"
+                counter = 2
+                while sdk_name in used_sdk_names:
+                    sdk_name = f"{tool_name}__{slug}_{counter}"
+                    counter += 1
+                used_sdk_names.add(sdk_name)
+
+                aliased = dict(row)
+                aliased["sdk_name"] = sdk_name
+                output.append(aliased)
+
+        output.sort(key=lambda row: str(row.get("sdk_name") or "").strip())
         return output
 
     def _build_wrapped_tools(
         self,
         *,
-        available_tools: Dict[str, Dict[str, Any]],
+        available_tools: List[Dict[str, Any]],
         active_servers: List[Dict[str, Any]],
         tool_events: List[Dict[str, Any]],
         event_sink: Any | None = None,
-    ) -> Tuple[List[Any], List[str], Dict[str, str]]:
+    ) -> Tuple[List[Any], List[str], Dict[str, List[str]]]:
         wrapped: List[Any] = []
         allowed_tools: List[str] = []
-        internal_to_allowed: Dict[str, str] = {}
+        internal_to_allowed: Dict[str, List[str]] = {}
 
-        for tool_name, tool_def in sorted(available_tools.items(), key=lambda row: row[0]):
-            description = str(tool_def.get("description") or "").strip() or f"Execute {tool_name}"
+        for tool_def in available_tools:
+            sdk_name = str(tool_def.get("sdk_name") or "").strip()
+            internal_tool_name = str(tool_def.get("internal_tool_name") or "").strip()
+            if not sdk_name or not internal_tool_name:
+                continue
+
+            description = str(tool_def.get("description") or "").strip() or f"Execute {internal_tool_name}"
             source_server = str(tool_def.get("server_name") or "").strip()
             if source_server:
                 description = f"[Source server: {source_server}] {description}".strip()
-            if tool_name == "get_data" and source_server:
+            if internal_tool_name == "get_data" and source_server:
                 lowered = source_server.lower()
                 if "nys" in lowered or "new york state" in lowered or "mta" in lowered:
                     description = (
@@ -398,8 +466,13 @@ class AnthropicAgentSDKRuntime:
 
             wrapped.append(
                 self._tool_factory(
-                    sdk_name=tool_name,
-                    internal_tool_name=tool_name,
+                    sdk_name=sdk_name,
+                    internal_tool_name=internal_tool_name,
+                    preferred_server_id=(
+                        str(tool_def.get("server_id") or "").strip()
+                        if self.duplicate_tool_alias_enabled
+                        else ""
+                    ),
                     description=description,
                     input_schema=input_schema,
                     active_servers=active_servers,
@@ -408,9 +481,14 @@ class AnthropicAgentSDKRuntime:
                 )
             )
 
-            allowed_name = f"mcp__{self.server_alias}__{tool_name}"
+            allowed_name = f"mcp__{self.server_alias}__{sdk_name}"
             allowed_tools.append(allowed_name)
-            internal_to_allowed[tool_name] = allowed_name
+            internal_to_allowed.setdefault(internal_tool_name, [])
+            if allowed_name not in internal_to_allowed[internal_tool_name]:
+                internal_to_allowed[internal_tool_name].append(allowed_name)
+            internal_to_allowed.setdefault(sdk_name, [])
+            if allowed_name not in internal_to_allowed[sdk_name]:
+                internal_to_allowed[sdk_name].append(allowed_name)
 
         return wrapped, allowed_tools, internal_to_allowed
 
@@ -419,6 +497,7 @@ class AnthropicAgentSDKRuntime:
         *,
         sdk_name: str,
         internal_tool_name: str,
+        preferred_server_id: str,
         description: str,
         input_schema: Dict[str, Any],
         active_servers: List[Dict[str, Any]],
@@ -456,6 +535,7 @@ class AnthropicAgentSDKRuntime:
                 candidates, _ = self.tool_router.route_candidates(
                     tool_name=internal_tool_name,
                     servers=active_servers,
+                    preferred_server_id=preferred_server_id,
                 )
             except ToolRouterError as exc:
                 text = f"Tool routing failed for {internal_tool_name}: {exc.message}"
@@ -558,7 +638,7 @@ class AnthropicAgentSDKRuntime:
         self,
         *,
         selected_skills: List[Dict[str, Any]],
-        internal_to_allowed: Dict[str, str],
+        internal_to_allowed: Dict[str, List[str]],
     ) -> Dict[str, Any]:
         output: Dict[str, Any] = {}
         for item in selected_skills:
@@ -571,8 +651,14 @@ class AnthropicAgentSDKRuntime:
             description = str(item.get("description") or "").strip() or f"Specialist for {title}"
             instruction = str(item.get("instruction") or "").strip()
             tool_names = item.get("tools") if isinstance(item.get("tools"), list) else []
-            allowed = [internal_to_allowed.get(str(name or "").strip(), "") for name in tool_names]
-            allowed = [name for name in allowed if name]
+            allowed: List[str] = []
+            for name in tool_names:
+                mapped = internal_to_allowed.get(str(name or "").strip(), [])
+                mapped_values = [mapped] if isinstance(mapped, str) else list(mapped)
+                for allowed_name in mapped_values:
+                    value = str(allowed_name or "").strip()
+                    if value and value not in allowed:
+                        allowed.append(value)
             if not allowed:
                 continue
 

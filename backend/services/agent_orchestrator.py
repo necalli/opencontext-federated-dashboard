@@ -27,9 +27,10 @@ class AgentOrchestrator:
                 (
                     "You are an MCP orchestration assistant. Prefer direct facts from MCP tool outputs. "
                     "Route tool usage to the best-matching MCP server based on user intent: "
-                    "for NYC/New York/Socrata requests, prefer nyc-opengov tools (especially get_data); "
-                    "for New York State / NYS / MTA requests, prefer nys-opengov tools (especially get_data from data.ny.gov); "
+                    "for NYC/New York/Socrata requests, prefer nyc-opengov tools, especially get_data__nyc_opengov; "
+                    "for New York State / NYS / MTA requests, prefer nys-opengov tools, especially get_data__nys_opengov from data.ny.gov; "
                     "for Boston/CKAN requests, prefer ckan__* tools from opencontext-main. "
+                    "Use generic get_data only when alias-specific tools are unavailable. "
                     "If user intent is ambiguous across servers, ask a clarifying question before deep analysis."
                 ),
             )
@@ -51,12 +52,7 @@ class AgentOrchestrator:
 
         current_session_id = str(session_id or "").strip() or str(uuid.uuid4())
         history = list(self.sessions.get(current_session_id, []))
-        list_servers_fn = getattr(self.registry, "list_servers_internal", None)
-        if callable(list_servers_fn):
-            rows = list_servers_fn()
-        else:
-            rows = self.registry.list_servers()
-        servers = [row for row in rows if bool(row.get("enabled", True))]
+        servers = [row for row in self.registry.list_servers() if bool(row.get("enabled", True))]
         self.skill_registry.refresh()
         skill_context = self.skill_registry.resolve_for_message(prompt)
 
@@ -91,4 +87,3 @@ class AgentOrchestrator:
             "meta": meta,
             "session_id": current_session_id,
         }
-
