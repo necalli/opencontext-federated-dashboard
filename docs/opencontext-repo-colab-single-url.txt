@@ -1,0 +1,389 @@
+# Single-cell Colab bootstrap (single public URL, backend+MCP local via Vite proxy)
+# Paste into ONE Colab cell and run.
+
+NGROK_AUTHTOKEN = ""
+ANTHROPIC_API_KEY = ""  # optional
+DASHBOARD_REPO = "https://github.com/necalli/opencontext-federated-dashboard.git"
+DASHBOARD_BRANCH = "main"
+
+import os, json, time, pathlib, subprocess, requests, shutil, textwrap
+
+DASHBOARD_DIR = "/content/opencontext-federated-dashboard"
+OPENCONTEXT_DIR = "/content/OpenContext"
+
+def sh(cmd, check=True):
+    p = subprocess.run(["bash", "-lc", cmd], text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"Command failed ({p.returncode}): {cmd}")
+
+def sh_out(cmd):
+    return subprocess.check_output(["bash", "-lc", cmd], text=True).strip()
+
+def start_bg(name, cmd_list, log_path, cwd=None, env=None):
+    logf = open(log_path, "w", encoding="utf-8")
+    p = subprocess.Popen(cmd_list, cwd=cwd, env=env, stdout=logf, stderr=subprocess.STDOUT)
+    return p, logf
+
+def wait_http(url, timeout=180, headers=None):
+    end = time.time() + timeout
+    last = None
+    while time.time() < end:
+        try:
+            r = requests.get(url, timeout=8, headers=headers or {})
+            if r.status_code < 500:
+                return r
+            last = f"status={r.status_code}"
+        except Exception as e:
+            last = str(e)
+        time.sleep(2)
+    raise RuntimeError(f"Timeout waiting for {url}. Last error: {last}")
+
+def wait_post(url, payload, timeout=180, headers=None):
+    end = time.time() + timeout
+    last = None
+    while time.time() < end:
+        try:
+            r = requests.post(url, json=payload, timeout=12, headers=headers or {})
+            if r.status_code < 500:
+                return r
+            last = f"status={r.status_code}"
+        except Exception as e:
+            last = str(e)
+        time.sleep(2)
+    raise RuntimeError(f"Timeout waiting for POST {url}. Last error: {last}")
+
+def wait_ngrok_https(timeout=120):
+    end = time.time() + timeout
+    last = None
+    while time.time() < end:
+        try:
+            r = requests.get("http://127.0.0.1:4040/api/tunnels", timeout=5)
+            data = r.json()
+            for t in data.get("tunnels", []):
+                u = str(t.get("public_url", "")).strip()
+                if u.startswith("https://"):
+                    return u.rstrip("/")
+            last = "no https tunnel yet"
+        except Exception as e:
+            last = str(e)
+        time.sleep(2)
+    raise RuntimeError(f"Timed out reading ngrok tunnel URL. Last error: {last}")
+
+def safe_json_get(url, timeout=30):
+    r = requests.get(url, timeout=timeout, headers={"ngrok-skip-browser-warning": "true"})
+    try:
+        return r.json()
+    except Exception:
+        preview = (r.text or "")[:300]
+        raise RuntimeError(f"Non-JSON response from {url} | status={r.status_code} | body={preview}")
+
+if not NGROK_AUTHTOKEN or "REPLACE_WITH_YOUR_NGROK_TOKEN" in NGROK_AUTHTOKEN:
+    raise ValueError("Set NGROK_AUTHTOKEN before running.")
+
+print("Step 1/10: Safe cleanup")
+sh("for p in 3000 5100 8000 8100 8101 8200 4040; do lsof -t -i tcp:$p | xargs -r kill -9; done", check=False)
+sh("pkill -f 'mcp_http_bridge.main' || true", check=False)
+sh("pkill -f 'scripts/local_server.py' || true", check=False)
+sh("pkill -f 'tools/mcp_path_gateway.py' || true", check=False)
+sh("pkill -f 'python app.py' || true", check=False)
+sh("pkill -f 'vite.config.colab.mjs' || true", check=False)
+sh("pkill -f 'ngrok http 3000' || true", check=False)
+
+print("Step 2/10: System deps")
+sh("apt-get update -y")
+sh("apt-get install -y curl jq lsof git rsync patch")
+sh("curl -fsSL https://deb.nodesource.com/setup_20.x | bash -")
+sh("apt-get install -y nodejs")
+sh("node -v && npm -v")
+
+print("Step 3/10: Python deps + real ngrok binary")
+sh("python -m pip install -q --upgrade pip")
+sh("python -m pip install -q requests mcp-http-bridge")
+# Remove pyngrok shim if it exists
+sh("if [ -f /usr/local/bin/ngrok ] && grep -qi pyngrok /usr/local/bin/ngrok; then rm -f /usr/local/bin/ngrok; fi", check=False)
+# Install real ngrok binary via apt repo if needed
+sh("""
+if ! [ -x /usr/bin/ngrok ]; then
+  curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+  echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | tee /etc/apt/sources.list.d/ngrok.list >/dev/null
+  apt-get update -y
+  apt-get install -y ngrok
+fi
+""")
+NGROK_BIN = sh_out("if [ -x /usr/bin/ngrok ]; then echo /usr/bin/ngrok; else command -v ngrok; fi")
+print("Using real ngrok binary:", NGROK_BIN)
+subprocess.run([NGROK_BIN, "version"], check=True)
+subprocess.run([NGROK_BIN, "config", "add-authtoken", NGROK_AUTHTOKEN], check=True)
+
+print("Step 4/10: Clone repos")
+sh(f"rm -rf {DASHBOARD_DIR} {OPENCONTEXT_DIR}")
+sh(f"git clone --depth 1 --branch {DASHBOARD_BRANCH} {DASHBOARD_REPO} {DASHBOARD_DIR}")
+sh(f"git clone --depth 1 https://github.com/CityOfBoston/OpenContext.git {OPENCONTEXT_DIR}")
+
+print("Step 5/10: Install project deps")
+sh(f"python -m pip install -q -r {DASHBOARD_DIR}/backend/requirements.txt")
+sh(f"if [ -f {OPENCONTEXT_DIR}/requirements.txt ]; then python -m pip install -q -r {OPENCONTEXT_DIR}/requirements.txt; fi", check=False)
+sh(f"cd {DASHBOARD_DIR}/frontend && npm install")
+
+print("Step 6/10: Start OpenContext + OpenGov bridges")
+procs = []
+
+# Hard-reset OpenContext for deterministic state (prevents missing-dir edge cases)
+sh(f"rm -rf {OPENCONTEXT_DIR}")
+sh(f"git clone --depth 1 https://github.com/CityOfBoston/OpenContext.git {OPENCONTEXT_DIR}")
+
+oc_root = pathlib.Path(OPENCONTEXT_DIR)
+if not oc_root.exists():
+    raise RuntimeError(f"OpenContext directory missing after clone: {OPENCONTEXT_DIR}")
+
+# Install OpenContext deps
+sh(f"python -m pip install -q -e {OPENCONTEXT_DIR}", check=False)
+if (oc_root / "requirements.txt").exists():
+    sh(f"python -m pip install -q -r {OPENCONTEXT_DIR}/requirements.txt", check=False)
+
+# Write config.yaml with Python (avoid heredoc issues)
+oc_root = pathlib.Path("/content/OpenContext")
+
+# normalize path state
+if oc_root.exists() and not oc_root.is_dir():
+    oc_root.unlink()
+oc_root.mkdir(parents=True, exist_ok=True)
+
+# Standalone runtime config (avoid broken symlink at /content/OpenContext/config.yaml)
+cfg = pathlib.Path("/content/opencontext-runtime-config.yaml")
+cfg.write_text(
+    """---
+server_name: "Boston OpenData MCP"
+description: "Boston open data MCP server"
+organization: "City of Boston"
+
+plugins:
+  ckan:
+    enabled: true
+    base_url: "https://data.boston.gov"
+    portal_url: "https://data.boston.gov"
+    city_name: "Boston"
+    timeout: 120
+
+logging:
+  level: "INFO"
+  format: "json"
+""",
+    encoding="utf-8",
+)
+print("Wrote:", cfg)
+
+if not cfg.exists():
+    raise RuntimeError(f"Failed to create {cfg}")
+print("Wrote:", cfg)
+
+
+# Pick entrypoint robustly
+entrypoint = "scripts/local_server.py" if (oc_root / "scripts" / "local_server.py").exists() else "local_server.py"
+if not (oc_root / entrypoint).exists():
+    raise RuntimeError(f"OpenContext entrypoint not found: {oc_root / entrypoint}")
+print("OpenContext entrypoint:", entrypoint)
+
+# Start OpenContext with explicit config path
+opencontext_env = os.environ.copy()
+opencontext_env["OPENCONTEXT_CONFIG"] = str(cfg)
+
+p_opencontext, lf_opencontext = start_bg(
+    "opencontext",
+    ["python", "-u", entrypoint],
+    "/content/opencontext.log",
+    cwd=OPENCONTEXT_DIR,
+    env=opencontext_env,
+)
+procs.append((p_opencontext, lf_opencontext))
+
+# Wait for readiness
+start = time.time()
+last_err = None
+while time.time() - start < 240:
+    if p_opencontext.poll() is not None:
+        try:
+            tail = sh_out("tail -n 120 /content/opencontext.log")
+        except Exception:
+            tail = "(could not read /content/opencontext.log)"
+        raise RuntimeError(
+            "OpenContext process exited before becoming ready.\n"
+            f"Exit code: {p_opencontext.returncode}\n\n"
+            f"Log tail:\n{tail}"
+        )
+    try:
+        r = requests.post(
+            "http://127.0.0.1:8000/mcp",
+            json={"jsonrpc":"2.0","id":"1","method":"ping","params":{}},
+            timeout=10,
+            headers={"Content-Type":"application/json","Accept":"application/json, text/event-stream"},
+        )
+        if r.status_code < 500:
+            print("OpenContext MCP is reachable on :8000/mcp")
+            break
+        last_err = f"status={r.status_code} body={(r.text or '')[:200]}"
+    except Exception as e:
+        last_err = str(e)
+    time.sleep(2)
+else:
+    try:
+        tail = sh_out("tail -n 120 /content/opencontext.log")
+    except Exception:
+        tail = "(could not read /content/opencontext.log)"
+    raise RuntimeError(
+        f"Timeout waiting for OpenContext MCP on :8000/mcp. Last error: {last_err}\n\nLog tail:\n{tail}"
+    )
+
+
+
+opengov_cfg = {
+    "server": {
+        "command": "npx",
+        "args": ["-y", "opengov-mcp-server@latest"],
+        "env": {"DATA_PORTAL_URL": "https://data.cityofnewyork.us"},
+    }
+}
+pathlib.Path("/content/opengov-bridge.json").write_text(json.dumps(opengov_cfg, indent=2), encoding="utf-8")
+p, lf = start_bg(
+    "opengov-nyc",
+    ["python", "-m", "mcp_http_bridge.main", "--config", "/content/opengov-bridge.json", "--host", "0.0.0.0", "--port", "8100", "--path", "/mcp"],
+    "/content/opengov-bridge.log",
+)
+procs.append((p, lf))
+wait_post(
+    "http://127.0.0.1:8100/mcp",
+    {"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"colab-check","version":"0.1.0"},"capabilities":{"tools":{}}}},
+    timeout=180,
+    headers={"Content-Type":"application/json","Accept":"application/json, text/event-stream"},
+)
+
+opengov_nys_cfg = {
+    "server": {
+        "command": "npx",
+        "args": ["-y", "opengov-mcp-server@latest"],
+        "env": {"DATA_PORTAL_URL": "https://data.ny.gov"},
+    }
+}
+pathlib.Path("/content/opengov-nys-bridge.json").write_text(json.dumps(opengov_nys_cfg, indent=2), encoding="utf-8")
+p, lf = start_bg(
+    "opengov-nys",
+    ["python", "-m", "mcp_http_bridge.main", "--config", "/content/opengov-nys-bridge.json", "--host", "0.0.0.0", "--port", "8101", "--path", "/mcp"],
+    "/content/opengov-nys-bridge.log",
+)
+procs.append((p, lf))
+wait_post(
+    "http://127.0.0.1:8101/mcp",
+    {"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"colab-check","version":"0.1.0"},"capabilities":{"tools":{}}}},
+    timeout=180,
+    headers={"Content-Type":"application/json","Accept":"application/json, text/event-stream"},
+)
+
+print("Step 7/10: Start MCP path gateway")
+gw_env = os.environ.copy()
+gw_env.update({
+    "MCP_OPENCONTEXT_URL": "http://127.0.0.1:8000/mcp",
+    "MCP_OPENGOV_URL": "http://127.0.0.1:8100/mcp",
+    "MCP_OPENGOV_NYS_URL": "http://127.0.0.1:8101/mcp",
+    "MCP_GATEWAY_HOST": "0.0.0.0",
+    "MCP_GATEWAY_PORT": "8200",
+})
+p, lf = start_bg("mcp-gateway", ["python", "tools/mcp_path_gateway.py"], "/content/mcp-gateway.log", cwd=f"{DASHBOARD_DIR}/backend", env=gw_env)
+procs.append((p, lf))
+wait_http("http://127.0.0.1:8200/_gateway/health", timeout=120)
+
+print("Step 8/10: Start backend")
+backend_env = os.environ.copy()
+backend_env.update({
+    "BACKEND_HOST": "0.0.0.0",
+    "BACKEND_PORT": "5100",
+    "MCP_DEFAULT_SERVER_AUTO_REGISTER": "true",
+    "AGENT_RUNTIME_PRIMARY": "agent_sdk",
+    "AGENT_SDK_NATIVE_SKILLS_ENABLED": "true",
+    "AGENT_SDK_PERMISSION_MODE": "default",
+    "AGENT_SDK_SETTING_SOURCES": "project",
+    "AGENT_SDK_AUTO_APPROVE_BUILTINS_ENABLED": "true",
+    "AGENT_SDK_AUTO_APPROVE_BUILTINS": ",".join([
+        "ToolSearch","AskUserQuestion","WebFetch","WebSearch","TodoWrite","NotebookEdit",
+        "TaskOutput","TaskStop","CronCreate","CronDelete","CronList",
+        "EnterPlanMode","ExitPlanMode","EnterWorktree",
+        "Bash","Read","Write","Edit","Glob","Grep","Skill","Agent"
+    ]),
+    "AGENT_SDK_DISALLOWED_TOOLS": "",
+})
+if ANTHROPIC_API_KEY:
+    backend_env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+
+backend_env["MCP_DEFAULT_SERVERS_JSON"] = json.dumps([
+    {"name":"opencontext-main","endpoint":"http://127.0.0.1:8200/opencontext/mcp","description":"OpenContext via local gateway","enabled":True},
+    {"name":"nyc-opengov","endpoint":"http://127.0.0.1:8200/opengov/mcp","description":"NYC Socrata via local gateway","enabled":True},
+    {"name":"nys-opengov","endpoint":"http://127.0.0.1:8200/opengov-nys/mcp","description":"NYS Socrata via local gateway","enabled":True},
+])
+
+p, lf = start_bg("backend", ["python", "app.py"], "/content/backend.log", cwd=f"{DASHBOARD_DIR}/backend", env=backend_env)
+procs.append((p, lf))
+wait_http("http://127.0.0.1:5100/health", timeout=120)
+
+print("Step 9/10: Start frontend tunnel (single public URL)")
+# Start ngrok FIRST for port 3000 to get URL
+p, lf = start_bg("ngrok-frontend", [NGROK_BIN, "http", "3000", "--log", "stdout", "--log-format", "json"], "/content/ngrok-frontend.log")
+procs.append((p, lf))
+FRONTEND_URL = wait_ngrok_https(timeout=120)
+print("FRONTEND_URL:", FRONTEND_URL)
+
+print("Step 10/10: Configure Vite proxy + start frontend")
+vite_colab = textwrap.dedent("""
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: '0.0.0.0',
+    port: 3000,
+    allowedHosts: ['.ngrok-free.dev', '.ngrok.dev', '.ngrok.io'],
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:5100',
+        changeOrigin: true
+      },
+      '/health': {
+        target: 'http://127.0.0.1:5100',
+        changeOrigin: true
+      }
+    }
+  }
+})
+""").strip() + "\n"
+
+pathlib.Path(f"{DASHBOARD_DIR}/frontend/vite.config.colab.mjs").write_text(vite_colab, encoding="utf-8")
+pathlib.Path(f"{DASHBOARD_DIR}/frontend/.env.local").write_text(
+    f"VITE_API_BASE_URL={FRONTEND_URL}\n", encoding="utf-8"
+)
+
+p, lf = start_bg(
+    "frontend",
+    ["npm", "run", "dev", "--", "--config", "vite.config.colab.mjs", "--host", "0.0.0.0", "--port", "3000"],
+    "/content/frontend.log",
+    cwd=f"{DASHBOARD_DIR}/frontend",
+)
+procs.append((p, lf))
+
+wait_http("http://127.0.0.1:3000", timeout=180)
+
+# Verify API through the SAME public frontend URL (must be JSON)
+remote_servers = safe_json_get(f"{FRONTEND_URL}/api/v1/mcp/servers", timeout=30)
+count = len(remote_servers.get("servers", [])) if isinstance(remote_servers, dict) else 0
+
+print("\n=== READY (Single-URL Mode) ===")
+print("FRONTEND_URL     :", FRONTEND_URL)
+print("BACKEND_LOCAL    : http://127.0.0.1:5100")
+print("MCP_GATEWAY_LOCAL: http://127.0.0.1:8200")
+print("Registered MCP servers:", count)
+print("\nLogs:")
+print("- opencontext    : /content/opencontext.log")
+print("- opengov-nyc    : /content/opengov-bridge.log")
+print("- opengov-nys    : /content/opengov-nys-bridge.log")
+print("- mcp-gateway    : /content/mcp-gateway.log")
+print("- backend        : /content/backend.log")
+print("- frontend       : /content/frontend.log")
+print("- ngrok-frontend : /content/ngrok-frontend.log")
