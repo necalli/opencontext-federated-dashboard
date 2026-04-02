@@ -690,6 +690,8 @@ class ServerRegistryService:
     def _public_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(record)
         headers = out.get("headers") if isinstance(out.get("headers"), dict) else {}
+        out.pop("headers", None)
+        out["has_headers"] = bool(headers)
         out["header_keys"] = sorted([str(key) for key in headers.keys()])
         return out
 
