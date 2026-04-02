@@ -62,7 +62,7 @@ class ServerRegistryService:
         return sorted(servers, key=lambda row: str(row.get("name") or "").lower())
 
     def list_servers_internal(self) -> List[Dict[str, Any]]:
-        rows = [dict(item) for item in self.storage.get_mcp_servers() if isinstance(item, dict)]
+        rows = [dict(item) for item in self.storage.get_mcp_servers()]
         return sorted(rows, key=lambda row: str(row.get("name") or "").lower())
 
     def ensure_default_servers_from_env(self) -> List[Dict[str, Any]]:
@@ -134,6 +134,12 @@ class ServerRegistryService:
         if not record:
             raise NotFoundError(f"Server '{server_id}' was not found")
         return self._public_record(record)
+
+    def get_server_internal(self, server_id: str) -> Dict[str, Any]:
+        record = self._find_server(server_id)
+        if not record:
+            raise NotFoundError(f"Server '{server_id}' was not found")
+        return dict(record)
 
     def create_server(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         clean = self._normalize_payload(payload, existing=None)
@@ -745,4 +751,3 @@ class ServerRegistryService:
             existing_id = str(rows[match_index].get("id") or "").strip()
             return self.update_server(existing_id, payload)
         return self.create_server(payload)
-

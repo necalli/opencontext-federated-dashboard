@@ -31,6 +31,10 @@ class AgentOrchestrator:
                     "for New York State / NYS / MTA requests, prefer nys-opengov tools, especially get_data__nys_opengov from data.ny.gov; "
                     "for Boston/CKAN requests, prefer ckan__* tools from opencontext-main. "
                     "Use generic get_data only when alias-specific tools are unavailable. "
+                    "When user asks to add/connect/onboard an MCP server, execute the MCP onboarding flow: "
+                    "first discover candidates and recommend options, then wait for explicit user confirmation, "
+                    "then upsert server registration, run MCP connection test, verify tools are listed for that server, "
+                    "and report pass/fail with actionable remediation. "
                     "If user intent is ambiguous across servers, ask a clarifying question before deep analysis."
                 ),
             )

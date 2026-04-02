@@ -8,11 +8,16 @@ import os
 import re
 import shutil
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .opencontext_mcp_client import MCPClientError, OpenContextMCPClient
+from .server_registry import NotFoundError, RegistryError, ServerRegistryService
 from .skill_packages import tool_allowed
+from .storage import Storage
 from .tool_router import ToolRouter, ToolRouterError
 
 try:
@@ -75,6 +80,17 @@ def _parse_csv(value: Any) -> List[str]:
     return out
 
 
+MCP_ONBOARDING_TOOL_NAMES: Tuple[str, ...] = (
+    "mcp_server_discover",
+    "mcp_server_onboard",
+    "mcp_servers_list",
+    "mcp_server_upsert",
+    "mcp_server_test",
+    "mcp_tools_list_by_server",
+    "mcp_server_disable",
+)
+
+
 class AgentSDKRuntimeError(Exception):
     def __init__(
         self,
@@ -105,6 +121,7 @@ class AnthropicAgentSDKRuntime:
         *,
         client_factory: Any | None = None,
         tool_router: ToolRouter | None = None,
+        server_registry: ServerRegistryService | None = None,
     ) -> None:
         self.api_key = str(os.getenv("ANTHROPIC_API_KEY", "")).strip()
         self.model = str(os.getenv("AGENT_SDK_MODEL", os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"))).strip()
@@ -134,6 +151,23 @@ class AnthropicAgentSDKRuntime:
             os.getenv("AGENT_SDK_DUPLICATE_TOOL_ALIAS_ENABLED", "true"),
             True,
         )
+        self.mcp_onboarding_enabled = _to_bool(
+            os.getenv("AGENT_SDK_MCP_ONBOARDING_ENABLED", "true"),
+            True,
+        )
+        self.mcp_discovery_enabled = _to_bool(
+            os.getenv("AGENT_SDK_MCP_DISCOVERY_ENABLED", "true"),
+            True,
+        )
+        self.mcp_discovery_timeout_seconds = max(
+            1.0,
+            float(int(os.getenv("AGENT_SDK_MCP_DISCOVERY_TIMEOUT_MS", "8000")) / 1000.0),
+        )
+        self.mcp_discovery_confirm_required = _to_bool(
+            os.getenv("AGENT_SDK_MCP_ONBOARD_CONFIRM_REQUIRED", "true"),
+            True,
+        )
+        self.smithery_api_key = str(os.getenv("SMITHERY_API_KEY", "")).strip()
         disallowed_default = (
             "ToolSearch,AskUserQuestion,WebFetch,WebSearch,TodoWrite,NotebookEdit,"
             "TaskOutput,TaskStop,CronCreate,CronDelete,CronList,EnterPlanMode,"
@@ -149,6 +183,7 @@ class AnthropicAgentSDKRuntime:
 
         self.client_factory = client_factory or OpenContextMCPClient
         self.tool_router = tool_router or ToolRouter(client_factory=self.client_factory)
+        self.server_registry = server_registry
 
     def generate(
         self,
@@ -181,12 +216,6 @@ class AnthropicAgentSDKRuntime:
             )
 
         active_servers = [row for row in mcp_servers if isinstance(row, dict) and bool(row.get("enabled", True))]
-        if not active_servers:
-            raise AgentSDKRuntimeError(
-                "no_servers",
-                "No enabled MCP servers are available for Agent SDK runtime",
-                retriable=False,
-            )
 
         scoped = skill_context if isinstance(skill_context, dict) else {}
         allowed_patterns = (
@@ -194,10 +223,18 @@ class AnthropicAgentSDKRuntime:
         )
         selected_skills = scoped.get("selected_skills") if isinstance(scoped.get("selected_skills"), list) else []
         visualization_requested = self._is_visualization_request(prompt)
+        onboarding_tool_names = self._allowed_onboarding_tool_names(allowed_patterns)
+
+        if not active_servers and not onboarding_tool_names:
+            raise AgentSDKRuntimeError(
+                "no_servers",
+                "No enabled MCP servers are available for Agent SDK runtime",
+                retriable=False,
+            )
 
         catalog = self.tool_router.build_catalog(active_servers)
         available_tools = self._catalog_tools_for_sdk(catalog.tools, allowed_patterns)
-        if not available_tools:
+        if not available_tools and not onboarding_tool_names:
             raise AgentSDKRuntimeError(
                 "no_tools",
                 "No MCP tools are available for Agent SDK execution",
@@ -217,8 +254,6 @@ class AnthropicAgentSDKRuntime:
             tool_events=tool_events,
             event_sink=event_sink,
         )
-        if not wrapped_tools:
-            raise AgentSDKRuntimeError("no_tools", "No tools could be wrapped for Agent SDK runtime", retriable=False)
         if self._visualization_tool_allowed(allowed_patterns, force=visualization_requested):
             wrapped_tools.append(
                 self._build_visualization_tool(
@@ -232,6 +267,23 @@ class AnthropicAgentSDKRuntime:
             internal_to_allowed.setdefault("create_visualization", [])
             if viz_allowed_name not in internal_to_allowed["create_visualization"]:
                 internal_to_allowed["create_visualization"].append(viz_allowed_name)
+
+        for onboarding_tool_name in onboarding_tool_names:
+            wrapped_tools.append(
+                self._build_mcp_onboarding_tool(
+                    tool_name=onboarding_tool_name,
+                    event_sink=event_sink,
+                )
+            )
+            allowed_name = f"mcp__{self.server_alias}__{onboarding_tool_name}"
+            if allowed_name not in allowed_tool_names:
+                allowed_tool_names.append(allowed_name)
+            internal_to_allowed.setdefault(onboarding_tool_name, [])
+            if allowed_name not in internal_to_allowed[onboarding_tool_name]:
+                internal_to_allowed[onboarding_tool_name].append(allowed_name)
+
+        if not wrapped_tools:
+            raise AgentSDKRuntimeError("no_tools", "No tools could be wrapped for Agent SDK runtime", retriable=False)
 
         subagents = self._build_subagents(
             selected_skills=selected_skills,
@@ -683,6 +735,1008 @@ class AnthropicAgentSDKRuntime:
                     pass
             output[agent_name] = definition_kwargs
         return output
+
+    def _allowed_onboarding_tool_names(self, allowed_patterns: List[str]) -> List[str]:
+        if not self.mcp_onboarding_enabled:
+            return []
+        if not allowed_patterns:
+            return list(MCP_ONBOARDING_TOOL_NAMES)
+        output: List[str] = []
+        for tool_name in MCP_ONBOARDING_TOOL_NAMES:
+            if tool_allowed(tool_name, allowed_patterns):
+                output.append(tool_name)
+        return output
+
+    def _build_mcp_onboarding_tool(
+        self,
+        *,
+        tool_name: str,
+        event_sink: Any | None = None,
+    ) -> Any:
+        if tool_name == "mcp_server_discover":
+            return self._build_mcp_server_discover_tool(event_sink=event_sink)
+        if tool_name == "mcp_servers_list":
+            return self._build_mcp_servers_list_tool(event_sink=event_sink)
+        if tool_name == "mcp_server_upsert":
+            return self._build_mcp_server_upsert_tool(event_sink=event_sink)
+        if tool_name == "mcp_server_test":
+            return self._build_mcp_server_test_tool(event_sink=event_sink)
+        if tool_name == "mcp_tools_list_by_server":
+            return self._build_mcp_tools_list_by_server_tool(event_sink=event_sink)
+        if tool_name == "mcp_server_disable":
+            return self._build_mcp_server_disable_tool(event_sink=event_sink)
+        if tool_name == "mcp_server_onboard":
+            return self._build_mcp_server_onboard_tool(event_sink=event_sink)
+        raise ValueError(f"Unsupported MCP onboarding tool: {tool_name}")
+
+    def _registry_service(self) -> ServerRegistryService:
+        if self.server_registry is None:
+            self.server_registry = ServerRegistryService(storage=Storage())
+        return self.server_registry
+
+    def _server_rows_for_runtime(self, *, enabled_only: Optional[bool] = None) -> List[Dict[str, Any]]:
+        rows = self._registry_service().list_servers_internal()
+        if enabled_only is True:
+            return [row for row in rows if bool(row.get("enabled", True))]
+        if enabled_only is False:
+            return [row for row in rows if not bool(row.get("enabled", True))]
+        return rows
+
+    def _resolve_server_selector(
+        self,
+        *,
+        server_id: str,
+        server_name: str,
+        enabled_only: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        rows = self._server_rows_for_runtime(enabled_only=enabled_only)
+        target_id = str(server_id or "").strip()
+        if target_id:
+            for row in rows:
+                if str(row.get("id") or "").strip() == target_id:
+                    return row
+            raise NotFoundError(
+                f"Server '{target_id}' was not found",
+                details={"server_id": target_id},
+            )
+
+        target_name = str(server_name or "").strip().casefold()
+        if target_name:
+            for row in rows:
+                if str(row.get("name") or "").strip().casefold() == target_name:
+                    return row
+            raise NotFoundError(
+                f"Server '{server_name}' was not found",
+                details={"server_name": str(server_name or "").strip()},
+            )
+
+        raise RegistryError(
+            "validation_error",
+            "server_id or server_name is required",
+        )
+
+    @staticmethod
+    def _safe_json_text(payload: Any) -> str:
+        try:
+            return json.dumps(payload, ensure_ascii=True, indent=2, default=str)
+        except Exception:
+            return str(payload)
+
+    def _tool_text_response(self, payload: Dict[str, Any], *, is_error: bool) -> Dict[str, Any]:
+        return {
+            "content": [{"type": "text", "text": self._safe_json_text(payload)}],
+            "is_error": bool(is_error),
+        }
+
+    def _http_json_get(
+        self,
+        *,
+        url: str,
+        headers: Dict[str, str] | None = None,
+    ) -> Any:
+        req_headers = {"Accept": "application/json"}
+        if isinstance(headers, dict):
+            for key, value in headers.items():
+                k = str(key or "").strip()
+                v = str(value or "").strip()
+                if k and v:
+                    req_headers[k] = v
+        try:
+            req = urllib.request.Request(url, headers=req_headers, method="GET")
+            with urllib.request.urlopen(req, timeout=self.mcp_discovery_timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            raise RegistryError(
+                "http_error",
+                f"HTTP {exc.code} while requesting discovery source",
+                details={"url": url, "status": int(exc.code)},
+            ) from exc
+        except Exception as exc:
+            raise RegistryError(
+                "network_error",
+                "Failed requesting discovery source",
+                details={"url": url, "reason": str(exc)},
+            ) from exc
+
+    @staticmethod
+    def _extract_items(payload: Any) -> List[Dict[str, Any]]:
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if not isinstance(payload, dict):
+            return []
+        for key in ("servers", "items", "results", "data"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                return [item for item in rows if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _extract_tags(item: Dict[str, Any]) -> List[str]:
+        tags = item.get("tags")
+        if isinstance(tags, list):
+            return [str(tag or "").strip() for tag in tags if str(tag or "").strip()]
+        categories = item.get("categories")
+        if isinstance(categories, list):
+            return [str(tag or "").strip() for tag in categories if str(tag or "").strip()]
+        return []
+
+    @staticmethod
+    def _extract_mcp_url(item: Dict[str, Any]) -> str:
+        for key in ("mcpUrl", "mcp_url", "endpoint", "url"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+        transports = item.get("transports")
+        if isinstance(transports, dict):
+            http_transport = transports.get("http")
+            if isinstance(http_transport, dict):
+                for key in ("url", "endpoint", "mcpUrl"):
+                    value = str(http_transport.get(key) or "").strip()
+                    if value:
+                        return value
+        return ""
+
+    def _normalize_discovery_item(
+        self,
+        *,
+        source: str,
+        item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        name = str(item.get("name") or item.get("title") or item.get("qualifiedName") or "").strip()
+        description = str(item.get("description") or item.get("summary") or item.get("shortDescription") or "").strip()
+        homepage = str(item.get("homepage") or item.get("website") or item.get("repositoryUrl") or "").strip()
+        mcp_url = self._extract_mcp_url(item)
+        tags = self._extract_tags(item)
+        updated_at = str(item.get("updatedAt") or item.get("updated_at") or item.get("lastUpdated") or "").strip()
+        return {
+            "source": source,
+            "name": name,
+            "description": description,
+            "mcp_url": mcp_url,
+            "homepage": homepage,
+            "tags": tags,
+            "updated_at": updated_at,
+            "raw": item,
+        }
+
+    def _discover_from_official_registry(self, *, query: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        encoded = urllib.parse.quote_plus(query)
+        urls = [
+            f"https://registry.modelcontextprotocol.io/v0/servers?query={encoded}&limit={limit}",
+            f"https://registry.modelcontextprotocol.io/v0/servers?q={encoded}&limit={limit}",
+            "https://registry.modelcontextprotocol.io/v0/servers",
+        ]
+        last_error: Dict[str, Any] | None = None
+        for url in urls:
+            try:
+                payload = self._http_json_get(url=url)
+                items = self._extract_items(payload)
+                normalized = [self._normalize_discovery_item(source="official_registry", item=item) for item in items]
+                if query.strip():
+                    normalized = self._filter_discovery_items_by_query(normalized, query=query)
+                return normalized[:limit], {"ok": True, "source": "official_registry", "url": url}
+            except RegistryError as exc:
+                last_error = {"source": "official_registry", "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}}
+        return [], {"ok": False, "source": "official_registry", "error": last_error or {"message": "unavailable"}}
+
+    def _discover_from_smithery(self, *, query: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        encoded = urllib.parse.quote_plus(query)
+        urls = [
+            f"https://api.smithery.ai/servers?q={encoded}&limit={limit}",
+            f"https://api.smithery.ai/servers?query={encoded}&limit={limit}",
+            "https://api.smithery.ai/servers",
+        ]
+        headers: Dict[str, str] = {}
+        if self.smithery_api_key:
+            headers["Authorization"] = f"Bearer {self.smithery_api_key}"
+        last_error: Dict[str, Any] | None = None
+        for url in urls:
+            try:
+                payload = self._http_json_get(url=url, headers=headers)
+                items = self._extract_items(payload)
+                normalized = [self._normalize_discovery_item(source="smithery", item=item) for item in items]
+                if query.strip():
+                    normalized = self._filter_discovery_items_by_query(normalized, query=query)
+                return normalized[:limit], {"ok": True, "source": "smithery", "url": url}
+            except RegistryError as exc:
+                last_error = {"source": "smithery", "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}}
+        return [], {"ok": False, "source": "smithery", "error": last_error or {"message": "unavailable"}}
+
+    def _discover_from_mcp_so(self, *, query: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        encoded = urllib.parse.quote_plus(query)
+        urls = [
+            f"https://mcp.so/api/search?q={encoded}",
+            f"https://mcp.so/api/servers?q={encoded}&limit={limit}",
+        ]
+        last_error: Dict[str, Any] | None = None
+        for url in urls:
+            try:
+                payload = self._http_json_get(url=url)
+                items = self._extract_items(payload)
+                normalized = [self._normalize_discovery_item(source="mcp_so", item=item) for item in items]
+                if query.strip():
+                    normalized = self._filter_discovery_items_by_query(normalized, query=query)
+                return normalized[:limit], {"ok": True, "source": "mcp_so", "url": url}
+            except RegistryError as exc:
+                last_error = {"source": "mcp_so", "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}}
+        return [], {"ok": False, "source": "mcp_so", "error": last_error or {"message": "unavailable"}}
+
+    @staticmethod
+    def _topic_tokens(query: str) -> List[str]:
+        tokens: List[str] = []
+        seen = set()
+        for token in re.split(r"[^a-z0-9]+", str(query or "").lower()):
+            value = token.strip()
+            if len(value) < 3 or value in seen:
+                continue
+            seen.add(value)
+            tokens.append(value)
+        return tokens
+
+    @staticmethod
+    def _filter_discovery_items_by_query(items: List[Dict[str, Any]], *, query: str) -> List[Dict[str, Any]]:
+        tokens = AnthropicAgentSDKRuntime._topic_tokens(query)
+        if not tokens:
+            return list(items)
+        filtered: List[Dict[str, Any]] = []
+        for item in items:
+            text = " ".join(
+                [
+                    str(item.get("name") or ""),
+                    str(item.get("description") or ""),
+                    " ".join([str(tag or "") for tag in (item.get("tags") if isinstance(item.get("tags"), list) else [])]),
+                ]
+            ).lower()
+            if any(token in text for token in tokens):
+                filtered.append(item)
+        return filtered
+
+    def _dedupe_discovery_candidates(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        seen = set()
+        output: List[Dict[str, Any]] = []
+        for row in rows:
+            name = str(row.get("name") or "").strip().casefold()
+            mcp_url = str(row.get("mcp_url") or "").strip().casefold()
+            key = (name, mcp_url)
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(row)
+        return output
+
+    def _existing_coverage_candidates(self, *, query: str) -> List[Dict[str, Any]]:
+        enabled_servers = self._server_rows_for_runtime(enabled_only=True)
+        if not enabled_servers:
+            return []
+        tokens = self._topic_tokens(query)
+        if not tokens:
+            return []
+        catalog = self.tool_router.build_catalog(enabled_servers)
+        server_tools: Dict[str, List[str]] = {}
+        for item in catalog.tools:
+            if not isinstance(item, dict):
+                continue
+            server_id = str(item.get("server_id") or "").strip()
+            tool_name = str(item.get("name") or "").strip()
+            if not server_id or not tool_name:
+                continue
+            server_tools.setdefault(server_id, [])
+            if tool_name not in server_tools[server_id]:
+                server_tools[server_id].append(tool_name)
+
+        output: List[Dict[str, Any]] = []
+        for row in enabled_servers:
+            server_id = str(row.get("id") or "").strip()
+            text = " ".join(
+                [
+                    str(row.get("name") or ""),
+                    str(row.get("description") or ""),
+                    " ".join(server_tools.get(server_id, [])),
+                ]
+            ).lower()
+            matches = [token for token in tokens if token in text]
+            if not matches:
+                continue
+            output.append(
+                {
+                    "id": server_id,
+                    "name": str(row.get("name") or "").strip(),
+                    "endpoint": str(row.get("endpoint") or "").strip(),
+                    "match_tokens": matches,
+                    "match_score": min(100, len(matches) * 18),
+                    "tool_count": len(server_tools.get(server_id, [])),
+                }
+            )
+        output.sort(key=lambda item: (-int(item.get("match_score") or 0), str(item.get("name") or "")))
+        return output
+
+    def _score_discovery_candidates(
+        self,
+        *,
+        query: str,
+        candidates: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        trust_weights = {
+            "official_registry": 35,
+            "smithery": 25,
+            "mcp_so": 10,
+        }
+        tokens = self._topic_tokens(query)
+        existing = self._server_rows_for_runtime(enabled_only=None)
+        existing_by_name = {str(row.get("name") or "").strip().casefold() for row in existing}
+        existing_by_endpoint = {str(row.get("endpoint") or "").strip().casefold() for row in existing}
+
+        scored: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            item = dict(candidate)
+            source = str(item.get("source") or "").strip()
+            name = str(item.get("name") or "").strip()
+            description = str(item.get("description") or "").strip()
+            endpoint = str(item.get("mcp_url") or "").strip()
+            tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+            text = f"{name} {description} {' '.join([str(tag or '') for tag in tags])}".lower()
+            reasons: List[str] = []
+            score = int(trust_weights.get(source, 0))
+            if score:
+                reasons.append(f"source_trust:{source}")
+
+            if endpoint.startswith("http://") or endpoint.startswith("https://"):
+                score += 20
+                reasons.append("endpoint_present")
+            else:
+                score -= 20
+                reasons.append("endpoint_missing_or_non_http")
+
+            match_count = 0
+            for token in tokens:
+                if token in text:
+                    match_count += 1
+            if match_count:
+                score += min(40, match_count * 12)
+                reasons.append(f"topic_match:{match_count}")
+
+            already_registered = False
+            if name and name.casefold() in existing_by_name:
+                score -= 50
+                already_registered = True
+                reasons.append("duplicate_name")
+            if endpoint and endpoint.casefold() in existing_by_endpoint:
+                score -= 50
+                already_registered = True
+                reasons.append("duplicate_endpoint")
+
+            item["score"] = int(score)
+            item["already_registered"] = already_registered
+            item["reasons"] = reasons
+            scored.append(item)
+
+        scored.sort(
+            key=lambda item: (
+                bool(item.get("already_registered")),
+                -int(item.get("score") or 0),
+                str(item.get("source") or ""),
+                str(item.get("name") or ""),
+            )
+        )
+        return scored
+
+    def _discover_server_candidates(
+        self,
+        *,
+        query: str,
+        limit: int,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        rows: List[Dict[str, Any]] = []
+        source_reports: List[Dict[str, Any]] = []
+        official_rows, official_report = self._discover_from_official_registry(query=query, limit=limit * 3)
+        rows.extend(official_rows)
+        source_reports.append(official_report)
+        smithery_rows, smithery_report = self._discover_from_smithery(query=query, limit=limit * 3)
+        rows.extend(smithery_rows)
+        source_reports.append(smithery_report)
+        mcp_so_rows, mcp_so_report = self._discover_from_mcp_so(query=query, limit=limit * 3)
+        rows.extend(mcp_so_rows)
+        source_reports.append(mcp_so_report)
+        rows = self._dedupe_discovery_candidates(rows)
+        ranked = self._score_discovery_candidates(query=query, candidates=rows)
+        return ranked[: max(1, int(limit))], source_reports
+
+    @staticmethod
+    def _normalize_headers(
+        headers: Any,
+        headers_env: Any,
+    ) -> Tuple[Dict[str, str], List[str]]:
+        output: Dict[str, str] = {}
+        missing_env: List[str] = []
+
+        if isinstance(headers, dict):
+            for key, value in headers.items():
+                k = str(key or "").strip()
+                v = str(value or "").strip()
+                if k and v:
+                    output[k] = v
+
+        if isinstance(headers_env, dict):
+            for key, env_name in headers_env.items():
+                header_key = str(key or "").strip()
+                env_key = str(env_name or "").strip()
+                if not header_key or not env_key:
+                    continue
+                env_value = str(os.getenv(env_key, "")).strip()
+                if env_value:
+                    output[header_key] = env_value
+                else:
+                    missing_env.append(env_key)
+
+        return output, missing_env
+
+    def _upsert_server_from_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(payload.get("name") or "").strip()
+        endpoint = str(payload.get("endpoint") or "").strip()
+        if not name:
+            raise RegistryError("validation_error", "name is required")
+        if not endpoint:
+            raise RegistryError("validation_error", "endpoint is required")
+
+        registry = self._registry_service()
+        rows = registry.list_servers_internal()
+        match: Dict[str, Any] | None = None
+        for row in rows:
+            if str(row.get("name") or "").strip().casefold() == name.casefold():
+                match = row
+                break
+        if match is None:
+            endpoint_lower = endpoint.casefold()
+            for row in rows:
+                if str(row.get("endpoint") or "").strip().casefold() == endpoint_lower:
+                    match = row
+                    break
+
+        update_payload = {
+            "name": name,
+            "endpoint": endpoint,
+            "description": str(payload.get("description") or "").strip(),
+            "enabled": bool(payload.get("enabled", True)),
+            "headers": payload.get("headers") if isinstance(payload.get("headers"), dict) else {},
+        }
+        if match is not None:
+            updated = registry.update_server(str(match.get("id") or ""), update_payload)
+            return {"action": "updated", "server": updated}
+        created = registry.create_server(update_payload)
+        return {"action": "created", "server": created}
+
+    def _build_mcp_servers_list_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "enabled_only": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_servers_list",
+            "List MCP servers currently registered in the dashboard control plane.",
+            input_schema,
+        )
+        async def _mcp_servers_list(args: Any) -> Dict[str, Any]:
+            payload = args if isinstance(args, dict) else {}
+            enabled_only = _to_bool(payload.get("enabled_only"), False)
+            servers = self._registry_service().list_servers()
+            if enabled_only:
+                servers = [row for row in servers if bool(row.get("enabled", True))]
+            response = {
+                "ok": True,
+                "server_count": len(servers),
+                "servers": servers,
+            }
+            self._emit_event(event_sink, {"event": "mcp_onboarding", "payload": {"action": "list_servers"}})
+            return self._tool_text_response(response, is_error=False)
+
+        return _mcp_servers_list
+
+    def _build_mcp_server_discover_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+                "include_existing_coverage": {"type": "boolean"},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_server_discover",
+            (
+                "Discover candidate MCP servers from public registries (Official MCP Registry first, "
+                "then Smithery, then MCP.so), rank by relevance/trust/operability, and return recommendations."
+            ),
+            input_schema,
+        )
+        async def _mcp_server_discover(args: Any) -> Dict[str, Any]:
+            if not self.mcp_discovery_enabled:
+                return self._tool_text_response(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "discovery_disabled",
+                            "message": "MCP server discovery is disabled by AGENT_SDK_MCP_DISCOVERY_ENABLED",
+                        },
+                    },
+                    is_error=True,
+                )
+
+            payload = args if isinstance(args, dict) else {}
+            query = str(payload.get("query") or "").strip()
+            if not query:
+                return self._tool_text_response(
+                    {"ok": False, "error": {"code": "validation_error", "message": "query is required"}},
+                    is_error=True,
+                )
+            limit = _to_int(payload.get("limit"), 5)
+            limit = max(1, min(10, limit))
+            include_existing = _to_bool(payload.get("include_existing_coverage"), True)
+
+            discovered, source_reports = self._discover_server_candidates(query=query, limit=limit)
+            existing_coverage = self._existing_coverage_candidates(query=query) if include_existing else []
+            recommended_existing = existing_coverage[0] if existing_coverage else None
+
+            recommendation: Dict[str, Any] | None = None
+            if recommended_existing and int(recommended_existing.get("match_score") or 0) >= 18:
+                recommendation = {
+                    "type": "reuse_existing",
+                    "server_id": str(recommended_existing.get("id") or "").strip(),
+                    "server_name": str(recommended_existing.get("name") or "").strip(),
+                    "reason": "Existing enabled server appears to cover this request.",
+                }
+            elif discovered:
+                top = discovered[0]
+                recommendation = {
+                    "type": "onboard_candidate",
+                    "name": str(top.get("name") or "").strip(),
+                    "mcp_url": str(top.get("mcp_url") or "").strip(),
+                    "source": str(top.get("source") or "").strip(),
+                    "score": int(top.get("score") or 0),
+                    "reason": "Top-ranked candidate by trust/relevance/operability.",
+                }
+
+            response = {
+                "ok": True,
+                "query": query,
+                "candidates": discovered,
+                "candidate_count": len(discovered),
+                "existing_coverage": existing_coverage,
+                "recommendation": recommendation,
+                "source_reports": source_reports,
+                "next_step": (
+                    "Confirm the recommended option before calling mcp_server_onboard with confirmed=true."
+                    if recommendation is not None
+                    else "No strong candidates found. Refine query or provide an endpoint manually."
+                ),
+            }
+            self._emit_event(
+                event_sink,
+                {
+                    "event": "mcp_onboarding",
+                    "payload": {"action": "discover_servers", "query": query, "candidate_count": len(discovered)},
+                },
+            )
+            return self._tool_text_response(response, is_error=False)
+
+        return _mcp_server_discover
+
+    def _build_mcp_server_upsert_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "endpoint": {"type": "string"},
+                "description": {"type": "string"},
+                "enabled": {"type": "boolean"},
+                "headers": {"type": "object"},
+                "headers_env": {"type": "object"},
+                "test_after_upsert": {"type": "boolean"},
+                "disable_on_failed_test": {"type": "boolean"},
+            },
+            "required": ["name", "endpoint"],
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_server_upsert",
+            (
+                "Create or update an MCP server in the dashboard registry by name/endpoint. "
+                "Supports secure header injection via headers_env."
+            ),
+            input_schema,
+        )
+        async def _mcp_server_upsert(args: Any) -> Dict[str, Any]:
+            payload = args if isinstance(args, dict) else {}
+            headers, missing_env = self._normalize_headers(payload.get("headers"), payload.get("headers_env"))
+            if missing_env:
+                return self._tool_text_response(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "missing_env_headers",
+                            "message": "One or more headers_env variables are missing",
+                            "details": {"missing_env": missing_env},
+                        },
+                    },
+                    is_error=True,
+                )
+
+            try:
+                upserted = self._upsert_server_from_payload(
+                    {
+                        "name": str(payload.get("name") or "").strip(),
+                        "endpoint": str(payload.get("endpoint") or "").strip(),
+                        "description": str(payload.get("description") or "").strip(),
+                        "enabled": bool(payload.get("enabled", True)),
+                        "headers": headers,
+                    }
+                )
+                server = upserted.get("server") if isinstance(upserted.get("server"), dict) else {}
+                server_id = str(server.get("id") or "").strip()
+                test_after = _to_bool(payload.get("test_after_upsert"), True)
+                disable_on_failed_test = _to_bool(payload.get("disable_on_failed_test"), False)
+                test_result: Dict[str, Any] | None = None
+                disabled_after_failure = False
+                if server_id and test_after:
+                    registry = self._registry_service()
+                    test_result = registry.test_connection(server_id)
+                    if (
+                        isinstance(test_result, dict)
+                        and not bool(test_result.get("ok"))
+                        and disable_on_failed_test
+                    ):
+                        registry.update_server(server_id, {"enabled": False})
+                        disabled_after_failure = True
+
+                response = {
+                    "ok": not (isinstance(test_result, dict) and not bool(test_result.get("ok"))),
+                    "action": str(upserted.get("action") or ""),
+                    "server": server,
+                    "test_result": test_result,
+                    "disabled_after_failure": disabled_after_failure,
+                }
+                self._emit_event(
+                    event_sink,
+                    {
+                        "event": "mcp_onboarding",
+                        "payload": {
+                            "action": "upsert_server",
+                            "server_id": server_id,
+                            "ok": bool(response.get("ok")),
+                        },
+                    },
+                )
+                return self._tool_text_response(response, is_error=not bool(response.get("ok")))
+            except RegistryError as exc:
+                return self._tool_text_response(
+                    {"ok": False, "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}},
+                    is_error=True,
+                )
+
+        return _mcp_server_upsert
+
+    def _build_mcp_server_test_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "server_id": {"type": "string"},
+                "server_name": {"type": "string"},
+            },
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_server_test",
+            "Run MCP handshake tests for a registered server and return stage-by-stage diagnostics.",
+            input_schema,
+        )
+        async def _mcp_server_test(args: Any) -> Dict[str, Any]:
+            payload = args if isinstance(args, dict) else {}
+            try:
+                server = self._resolve_server_selector(
+                    server_id=str(payload.get("server_id") or "").strip(),
+                    server_name=str(payload.get("server_name") or "").strip(),
+                    enabled_only=None,
+                )
+                server_id = str(server.get("id") or "").strip()
+                registry = self._registry_service()
+                result = registry.test_connection(server_id)
+                response = {
+                    "ok": bool(result.get("ok")),
+                    "server": registry.get_server(server_id),
+                    "test_result": result,
+                }
+                self._emit_event(
+                    event_sink,
+                    {
+                        "event": "mcp_onboarding",
+                        "payload": {"action": "test_server", "server_id": server_id, "ok": bool(result.get("ok"))},
+                    },
+                )
+                return self._tool_text_response(response, is_error=not bool(result.get("ok")))
+            except RegistryError as exc:
+                return self._tool_text_response(
+                    {"ok": False, "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}},
+                    is_error=True,
+                )
+
+        return _mcp_server_test
+
+    def _build_mcp_tools_list_by_server_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "server_id": {"type": "string"},
+                "server_name": {"type": "string"},
+                "enabled_only": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_tools_list_by_server",
+            "List tools exposed by one server (or all servers) using live tools/list capability checks.",
+            input_schema,
+        )
+        async def _mcp_tools_list_by_server(args: Any) -> Dict[str, Any]:
+            payload = args if isinstance(args, dict) else {}
+            enabled_only = _to_bool(payload.get("enabled_only"), True)
+            server_id = str(payload.get("server_id") or "").strip()
+            server_name = str(payload.get("server_name") or "").strip()
+            rows = self._server_rows_for_runtime(enabled_only=enabled_only)
+
+            if server_id or server_name:
+                try:
+                    selected = self._resolve_server_selector(
+                        server_id=server_id,
+                        server_name=server_name,
+                        enabled_only=enabled_only if enabled_only else None,
+                    )
+                    rows = [selected]
+                except RegistryError as exc:
+                    return self._tool_text_response(
+                        {"ok": False, "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}},
+                        is_error=True,
+                    )
+
+            if not rows:
+                return self._tool_text_response(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "not_found",
+                            "message": "No MCP servers matched the filter",
+                        },
+                    },
+                    is_error=True,
+                )
+
+            catalog = self.tool_router.build_catalog(rows)
+            response = {
+                "ok": len(catalog.errors) == 0,
+                "tool_count": len(catalog.tools),
+                "tools": catalog.tools,
+                "servers": [
+                    {
+                        "id": str(row.get("id") or "").strip(),
+                        "name": str(row.get("name") or "").strip(),
+                        "endpoint": str(row.get("endpoint") or "").strip(),
+                        "enabled": bool(row.get("enabled", True)),
+                    }
+                    for row in rows
+                ],
+                "errors": catalog.errors,
+                "filters": {
+                    "server_id": server_id or None,
+                    "server_name": server_name or None,
+                    "enabled_only": enabled_only,
+                },
+            }
+            self._emit_event(
+                event_sink,
+                {
+                    "event": "mcp_onboarding",
+                    "payload": {"action": "list_tools", "tool_count": int(response.get("tool_count") or 0)},
+                },
+            )
+            is_error = len(catalog.errors) > 0 and len(catalog.tools) == 0
+            return self._tool_text_response(response, is_error=is_error)
+
+        return _mcp_tools_list_by_server
+
+    def _build_mcp_server_disable_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "server_id": {"type": "string"},
+                "server_name": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_server_disable",
+            "Disable a server in registry. Use this to rollback failed onboarding attempts.",
+            input_schema,
+        )
+        async def _mcp_server_disable(args: Any) -> Dict[str, Any]:
+            payload = args if isinstance(args, dict) else {}
+            try:
+                server = self._resolve_server_selector(
+                    server_id=str(payload.get("server_id") or "").strip(),
+                    server_name=str(payload.get("server_name") or "").strip(),
+                    enabled_only=None,
+                )
+                server_id = str(server.get("id") or "").strip()
+                updated = self._registry_service().update_server(server_id, {"enabled": False})
+                response = {
+                    "ok": True,
+                    "reason": str(payload.get("reason") or "").strip(),
+                    "server": updated,
+                }
+                self._emit_event(
+                    event_sink,
+                    {"event": "mcp_onboarding", "payload": {"action": "disable_server", "server_id": server_id}},
+                )
+                return self._tool_text_response(response, is_error=False)
+            except RegistryError as exc:
+                return self._tool_text_response(
+                    {"ok": False, "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}},
+                    is_error=True,
+                )
+
+        return _mcp_server_disable
+
+    def _build_mcp_server_onboard_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "endpoint": {"type": "string"},
+                "description": {"type": "string"},
+                "enabled": {"type": "boolean"},
+                "headers": {"type": "object"},
+                "headers_env": {"type": "object"},
+                "disable_on_failed_test": {"type": "boolean"},
+                "confirmed": {"type": "boolean"},
+            },
+            "required": ["name", "endpoint"],
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_server_onboard",
+            (
+                "Idempotent onboarding flow for one MCP server: upsert in registry, test MCP connection, "
+                "verify visible tools, and optionally disable on failed test. "
+                "Use confirmed=true after user approves a discovery recommendation."
+            ),
+            input_schema,
+        )
+        async def _mcp_server_onboard(args: Any) -> Dict[str, Any]:
+            payload = args if isinstance(args, dict) else {}
+            headers, missing_env = self._normalize_headers(payload.get("headers"), payload.get("headers_env"))
+            if missing_env:
+                return self._tool_text_response(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "missing_env_headers",
+                            "message": "One or more headers_env variables are missing",
+                            "details": {"missing_env": missing_env},
+                        },
+                    },
+                    is_error=True,
+                )
+
+            confirmed = _to_bool(payload.get("confirmed"), False)
+            if self.mcp_discovery_confirm_required and not confirmed:
+                dry_run = {
+                    "ok": False,
+                    "confirmation_required": True,
+                    "message": (
+                        "Discovery/recommendation flow requires explicit confirmation before onboarding. "
+                        "Review candidates with mcp_server_discover, then call mcp_server_onboard with confirmed=true."
+                    ),
+                    "proposed_server": {
+                        "name": str(payload.get("name") or "").strip(),
+                        "endpoint": str(payload.get("endpoint") or "").strip(),
+                        "description": str(payload.get("description") or "").strip(),
+                        "enabled": bool(payload.get("enabled", True)),
+                        "header_keys": sorted([str(key) for key in headers.keys()]),
+                    },
+                }
+                return self._tool_text_response(dry_run, is_error=False)
+
+            try:
+                upserted = self._upsert_server_from_payload(
+                    {
+                        "name": str(payload.get("name") or "").strip(),
+                        "endpoint": str(payload.get("endpoint") or "").strip(),
+                        "description": str(payload.get("description") or "").strip(),
+                        "enabled": bool(payload.get("enabled", True)),
+                        "headers": headers,
+                    }
+                )
+                server = upserted.get("server") if isinstance(upserted.get("server"), dict) else {}
+                server_id = str(server.get("id") or "").strip()
+                registry = self._registry_service()
+                test_result = registry.test_connection(server_id)
+                tools_result: Dict[str, Any] = {"ok": False, "tool_count": 0, "tools": [], "errors": []}
+                if bool(test_result.get("ok")):
+                    rows = [registry.get_server_internal(server_id)]
+                    catalog = self.tool_router.build_catalog(rows)
+                    tools_result = {
+                        "ok": len(catalog.errors) == 0,
+                        "tool_count": len(catalog.tools),
+                        "tools": catalog.tools,
+                        "errors": catalog.errors,
+                    }
+
+                disable_on_failed_test = _to_bool(payload.get("disable_on_failed_test"), False)
+                disabled_after_failure = False
+                if disable_on_failed_test and not bool(test_result.get("ok")):
+                    registry.update_server(server_id, {"enabled": False})
+                    disabled_after_failure = True
+
+                overall_ok = bool(test_result.get("ok")) and int(tools_result.get("tool_count") or 0) > 0
+                response = {
+                    "ok": overall_ok,
+                    "action": str(upserted.get("action") or ""),
+                    "server": registry.get_server(server_id),
+                    "test_result": test_result,
+                    "tools_result": tools_result,
+                    "disabled_after_failure": disabled_after_failure,
+                }
+                self._emit_event(
+                    event_sink,
+                    {
+                        "event": "mcp_onboarding",
+                        "payload": {
+                            "action": "onboard_server",
+                            "server_id": server_id,
+                            "ok": overall_ok,
+                            "tool_count": int(tools_result.get("tool_count") or 0),
+                        },
+                    },
+                )
+                return self._tool_text_response(response, is_error=not overall_ok)
+            except RegistryError as exc:
+                return self._tool_text_response(
+                    {"ok": False, "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}},
+                    is_error=True,
+                )
+
+        return _mcp_server_onboard
 
     def _visualization_tool_allowed(self, allowed_patterns: List[str], *, force: bool = False) -> bool:
         if not self.visualization_tool_enabled:
