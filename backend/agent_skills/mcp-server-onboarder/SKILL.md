@@ -1,0 +1,82 @@
+---
+name: mcp-server-onboarder
+description: >
+  Onboard, validate, and operationalize new MCP servers in the dashboard control plane.
+  Use for requests to add/register/connect a new MCP server, verify connectivity, confirm tools,
+  and update server availability safely.
+---
+
+# MCP Server Onboarder
+
+Use this workflow whenever the user asks to add or connect a new MCP server.
+
+## Preferred Tools
+
+- `mcp_server_onboard`
+- `mcp_servers_list`
+- `mcp_server_upsert`
+- `mcp_server_test`
+- `mcp_tools_list_by_server`
+- `mcp_server_disable`
+
+## Goals
+
+1. Add or update server registration in dashboard registry.
+2. Run connection handshake test (`ping`, `initialize`, `tools/list`).
+3. Verify tools appear for the new server in catalog.
+4. Return explicit pass/fail status and next action.
+
+## Input Contract
+
+Extract or request these fields:
+
+- `name`: stable server alias (for example `chicago-opendata`)
+- `endpoint`: MCP HTTP endpoint (`https://.../mcp`)
+- `description`: short operator label
+- `enabled`: default `true` unless user says otherwise
+- `headers_env` preferred over raw `headers` for secrets
+
+If endpoint is missing or ambiguous, ask one short clarifying question.
+
+## Execution Flow
+
+1. Baseline inventory:
+   - Call `mcp_servers_list` to understand current state and avoid duplicate naming.
+2. Primary onboarding:
+   - Call `mcp_server_onboard` first with normalized payload.
+3. If onboarding returns failure:
+   - Call `mcp_server_test` for detailed stage diagnostics.
+   - If user requested rollback or if explicitly unsafe to keep enabled, call `mcp_server_disable`.
+4. Final verification:
+   - Call `mcp_tools_list_by_server` for the server and confirm non-zero tools.
+5. Report:
+   - Provide a concise operator summary (status, server id/name, tool count, errors/remediation).
+
+## Safety Rules
+
+1. Do not invent endpoints, headers, or auth tokens.
+2. Prefer `headers_env` over literal secrets.
+3. Treat onboarding as failed unless connection test is OK and tools are visible.
+4. If onboarding fails, provide exact failing stage and suggested fix.
+5. Keep existing servers untouched unless user asks to modify them.
+
+## Response Template
+
+Use this output format:
+
+### MCP Onboarding Result
+
+- `status`: `passed` or `failed`
+- `server`: `<name> (<id>)`
+- `endpoint`: `<normalized endpoint>`
+- `test_stage`: `<complete|ping|initialize|tools/list|...>`
+- `tool_count`: `<n>`
+- `actions_taken`: `<created/updated/disabled>`
+- `next_step`: `<operator action>`
+
+If failed, include `error.code`, `error.message`, and one remediation bullet.
+
+## References
+
+- `references/server_manifest_schema.md`
+- `references/onboarding_runbook.md`
