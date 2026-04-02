@@ -46,6 +46,7 @@ class SkillPackageTests(unittest.TestCase):
         )
         self.assertIn("mcp-server-onboarder", context["selected_skill_ids"])
         self.assertIn("mcp_server_onboard", context["allowed_tool_patterns"])
+        self.assertIn("mcp_server_discover", context["allowed_tool_patterns"])
 
 
 if __name__ == "__main__":

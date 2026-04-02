@@ -100,6 +100,7 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
         with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
             runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
             names = runtime._allowed_onboarding_tool_names([])
+        self.assertIn("mcp_server_discover", names)
         self.assertIn("mcp_server_onboard", names)
         self.assertIn("mcp_server_upsert", names)
 
@@ -140,6 +141,30 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
             )
         self.assertEqual(headers, {})
         self.assertEqual(missing, ["MISSING_TOKEN"])
+
+    def test_score_discovery_candidates_prefers_official_registry(self) -> None:
+        with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
+            runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
+            scored = runtime._score_discovery_candidates(
+                query="nyc public housing",
+                candidates=[
+                    {
+                        "source": "mcp_so",
+                        "name": "NYC Housing MCP",
+                        "description": "NYC housing datasets",
+                        "mcp_url": "https://community.example.dev/mcp",
+                        "tags": ["nyc", "housing"],
+                    },
+                    {
+                        "source": "official_registry",
+                        "name": "NYC Housing MCP",
+                        "description": "NYC housing datasets",
+                        "mcp_url": "https://official.example.dev/mcp",
+                        "tags": ["nyc", "housing"],
+                    },
+                ],
+            )
+        self.assertEqual(str(scored[0].get("source") or ""), "official_registry")
 
 
 if __name__ == "__main__":

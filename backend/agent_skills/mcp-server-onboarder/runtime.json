@@ -2,6 +2,7 @@
   "enabled": true,
   "always_on": false,
   "tools": [
+    "mcp_server_discover",
     "mcp_server_onboard",
     "mcp_servers_list",
     "mcp_server_upsert",
@@ -13,6 +14,9 @@
     "add mcp server",
     "onboard mcp",
     "register mcp server",
+    "discover mcp servers",
+    "find mcp servers",
+    "recommend mcp server",
     "connect new data source",
     "integrate mcp server",
     "add server to dashboard",

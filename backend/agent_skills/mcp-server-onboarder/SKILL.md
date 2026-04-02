@@ -12,6 +12,7 @@ Use this workflow whenever the user asks to add or connect a new MCP server.
 
 ## Preferred Tools
 
+- `mcp_server_discover`
 - `mcp_server_onboard`
 - `mcp_servers_list`
 - `mcp_server_upsert`
@@ -42,14 +43,18 @@ If endpoint is missing or ambiguous, ask one short clarifying question.
 
 1. Baseline inventory:
    - Call `mcp_servers_list` to understand current state and avoid duplicate naming.
-2. Primary onboarding:
-   - Call `mcp_server_onboard` first with normalized payload.
-3. If onboarding returns failure:
+2. Discovery and recommendation:
+   - Call `mcp_server_discover` with the user topic (for example `NYC public housing`).
+   - Return top options with one recommendation.
+   - Ask the user for explicit confirmation before any registry mutation.
+3. Primary onboarding (only after confirmation):
+   - Call `mcp_server_onboard` with `confirmed=true` and normalized payload.
+4. If onboarding returns failure:
    - Call `mcp_server_test` for detailed stage diagnostics.
    - If user requested rollback or if explicitly unsafe to keep enabled, call `mcp_server_disable`.
-4. Final verification:
+5. Final verification:
    - Call `mcp_tools_list_by_server` for the server and confirm non-zero tools.
-5. Report:
+6. Report:
    - Provide a concise operator summary (status, server id/name, tool count, errors/remediation).
 
 ## Safety Rules
@@ -57,8 +62,9 @@ If endpoint is missing or ambiguous, ask one short clarifying question.
 1. Do not invent endpoints, headers, or auth tokens.
 2. Prefer `headers_env` over literal secrets.
 3. Treat onboarding as failed unless connection test is OK and tools are visible.
-4. If onboarding fails, provide exact failing stage and suggested fix.
-5. Keep existing servers untouched unless user asks to modify them.
+4. Require explicit confirmation before mutation (`mcp_server_onboard` with `confirmed=true`).
+5. If onboarding fails, provide exact failing stage and suggested fix.
+6. Keep existing servers untouched unless user asks to modify them.
 
 ## Response Template
 
@@ -80,3 +86,4 @@ If failed, include `error.code`, `error.message`, and one remediation bullet.
 
 - `references/server_manifest_schema.md`
 - `references/onboarding_runbook.md`
+- `references/discovery_sources.md`

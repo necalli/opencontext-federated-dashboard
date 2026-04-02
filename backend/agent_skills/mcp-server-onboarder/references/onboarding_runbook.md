@@ -5,8 +5,10 @@ This runbook defines pass/fail criteria for MCP server onboarding.
 ## Standard Sequence
 
 1. `mcp_servers_list`
-2. `mcp_server_onboard`
-3. `mcp_tools_list_by_server`
+2. `mcp_server_discover`
+3. User confirmation on selected option
+4. `mcp_server_onboard` with `confirmed=true`
+5. `mcp_tools_list_by_server`
 4. Optional failure path:
    - `mcp_server_test`
    - `mcp_server_disable`
