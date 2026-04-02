@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import html
 import inspect
 import json
 import os
@@ -167,7 +168,6 @@ class AnthropicAgentSDKRuntime:
             os.getenv("AGENT_SDK_MCP_ONBOARD_CONFIRM_REQUIRED", "true"),
             True,
         )
-        self.smithery_api_key = str(os.getenv("SMITHERY_API_KEY", "")).strip()
         disallowed_default = (
             "ToolSearch,AskUserQuestion,WebFetch,WebSearch,TodoWrite,NotebookEdit,"
             "TaskOutput,TaskStop,CronCreate,CronDelete,CronList,EnterPlanMode,"
@@ -860,6 +860,139 @@ class AnthropicAgentSDKRuntime:
             ) from exc
 
     @staticmethod
+    def _http_text_get(
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Dict[str, str] | None = None,
+    ) -> str:
+        req_headers = {"Accept": "text/html,application/xhtml+xml"}
+        if isinstance(headers, dict):
+            for key, value in headers.items():
+                k = str(key or "").strip()
+                v = str(value or "").strip()
+                if k and v:
+                    req_headers[k] = v
+        try:
+            req = urllib.request.Request(url, headers=req_headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            raise RegistryError(
+                "http_error",
+                f"HTTP {exc.code} while requesting discovery source",
+                details={"url": url, "status": int(exc.code)},
+            ) from exc
+        except Exception as exc:
+            raise RegistryError(
+                "network_error",
+                "Failed requesting discovery source",
+                details={"url": url, "reason": str(exc)},
+            ) from exc
+
+    @staticmethod
+    def _strip_html_text(value: str) -> str:
+        text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", str(value or ""))
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = html.unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    @staticmethod
+    def _extract_http_urls(value: str) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for raw in re.findall(r"https?://[^\s\"'<>()]+", str(value or "")):
+            url = str(raw or "").strip().rstrip(".,;:!?)")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            out.append(url)
+        return out
+
+    @staticmethod
+    def _infer_auth_requirement(*, text: str) -> Tuple[str, List[str]]:
+        blob = str(text or "").lower()
+        evidence: List[str] = []
+
+        no_auth_patterns = [
+            r"\bno auth(?:entication)?\b",
+            r"\bno api key\b",
+            r"\bwithout (?:an )?api key\b",
+            r"\bauth(?:entication)?\s*:\s*none\b",
+            r"\bnone required\b",
+            r"\bno login required\b",
+        ]
+        auth_patterns = [
+            r"\boauth(?:2(?:\.1)?)?\b",
+            r"\bapi key\b",
+            r"\bx-api-key\b",
+            r"\bauthorization\b",
+            r"\bbearer\b",
+            r"\baccess token\b",
+            r"\blogin required\b",
+            r"\bauth(?:entication)? required\b",
+        ]
+
+        for pattern in no_auth_patterns:
+            if re.search(pattern, blob):
+                evidence.append(pattern)
+        if evidence:
+            return "no_auth_required", evidence
+
+        auth_evidence: List[str] = []
+        for pattern in auth_patterns:
+            if re.search(pattern, blob):
+                auth_evidence.append(pattern)
+        if auth_evidence:
+            return "auth_required", auth_evidence
+        return "unknown", []
+
+    @staticmethod
+    def _build_vetting(
+        *,
+        endpoint: str,
+        homepage: str,
+        auth_requirement: str,
+        source_count: int = 1,
+    ) -> Dict[str, Any]:
+        endpoint = str(endpoint or "").strip()
+        homepage = str(homepage or "").strip()
+        checks = {
+            "endpoint_present": bool(endpoint),
+            "endpoint_https": endpoint.startswith("https://"),
+            "endpoint_looks_mcp": bool(re.search(r"/mcp(?:$|[/?#])", endpoint, re.IGNORECASE)),
+            "has_repo_or_homepage": bool(homepage),
+            "cross_source_verified": int(source_count) > 1,
+        }
+        score = 0
+        if checks["endpoint_present"]:
+            score += 25
+        if checks["endpoint_https"]:
+            score += 20
+        if checks["endpoint_looks_mcp"]:
+            score += 20
+        if checks["has_repo_or_homepage"]:
+            score += 15
+        if checks["cross_source_verified"]:
+            score += 20
+        if auth_requirement == "no_auth_required":
+            score += 5
+        elif auth_requirement == "unknown":
+            score -= 5
+
+        verdict = "low"
+        if score >= 70:
+            verdict = "high"
+        elif score >= 45:
+            verdict = "medium"
+        return {
+            "score": int(max(0, min(100, score))),
+            "verdict": verdict,
+            "checks": checks,
+        }
+
+    @staticmethod
     def _extract_items(payload: Any) -> List[Dict[str, Any]]:
         if isinstance(payload, list):
             return [item for item in payload if isinstance(item, dict)]
@@ -870,6 +1003,89 @@ class AnthropicAgentSDKRuntime:
             if isinstance(rows, list):
                 return [item for item in rows if isinstance(item, dict)]
         return []
+
+    @staticmethod
+    def _extract_mcpmarket_server_links(search_html: str, *, limit: int) -> List[str]:
+        links: List[str] = []
+        seen = set()
+        for href in re.findall(r'href=["\'](/server/[^"\'>?#]+)["\']', str(search_html or ""), flags=re.IGNORECASE):
+            path = str(href or "").strip()
+            if not path:
+                continue
+            url = f"https://mcpmarket.com{path}"
+            if url in seen:
+                continue
+            seen.add(url)
+            links.append(url)
+            if len(links) >= limit:
+                break
+        return links
+
+    def _normalize_mcpmarket_page(self, *, page_url: str, html_text: str) -> Dict[str, Any]:
+        title_match = re.search(r"(?is)<h1[^>]*>(.*?)</h1>", html_text or "")
+        title = self._strip_html_text(title_match.group(1) if title_match else "")
+        if not title:
+            title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", html_text or "")
+            title = self._strip_html_text(title_match.group(1) if title_match else "")
+        meta_desc_match = re.search(
+            r'(?is)<meta[^>]+(?:name|property)=["\'](?:description|og:description)["\'][^>]+content=["\'](.*?)["\']',
+            html_text or "",
+        )
+        description = self._strip_html_text(meta_desc_match.group(1) if meta_desc_match else "")
+        visible_text = self._strip_html_text(html_text or "")
+        if not description:
+            description = visible_text[:320]
+
+        urls = self._extract_http_urls(html_text or "")
+        endpoint = ""
+        for candidate in urls:
+            lower = candidate.lower()
+            if "mcpmarket.com" in lower:
+                continue
+            if re.search(r"/mcp(?:$|[/?#])", lower) or re.search(r"/api(?:$|[/?#])", lower):
+                endpoint = candidate
+                break
+        if not endpoint:
+            for candidate in urls:
+                lower = candidate.lower()
+                if "mcpmarket.com" in lower:
+                    continue
+                endpoint = candidate
+                break
+
+        homepage = ""
+        for candidate in urls:
+            if "github.com/" in candidate.lower():
+                homepage = candidate
+                break
+        if not homepage:
+            for candidate in urls:
+                if "mcpmarket.com" in candidate.lower():
+                    continue
+                homepage = candidate
+                break
+
+        auth_requirement, auth_evidence = self._infer_auth_requirement(text=f"{title} {description} {visible_text}")
+        vetting = self._build_vetting(
+            endpoint=endpoint,
+            homepage=homepage,
+            auth_requirement=auth_requirement,
+            source_count=1,
+        )
+
+        return {
+            "source": "mcpmarket",
+            "name": title,
+            "description": description,
+            "mcp_url": endpoint,
+            "homepage": homepage,
+            "tags": [],
+            "updated_at": "",
+            "auth_requirement": auth_requirement,
+            "auth_evidence": auth_evidence,
+            "verification": vetting,
+            "raw": {"page_url": page_url},
+        }
 
     @staticmethod
     def _extract_tags(item: Dict[str, Any]) -> List[str]:
@@ -909,6 +1125,15 @@ class AnthropicAgentSDKRuntime:
         mcp_url = self._extract_mcp_url(item)
         tags = self._extract_tags(item)
         updated_at = str(item.get("updatedAt") or item.get("updated_at") or item.get("lastUpdated") or "").strip()
+        auth_requirement, auth_evidence = self._infer_auth_requirement(
+            text=f"{name} {description} {' '.join(tags)} {homepage} {json.dumps(item, ensure_ascii=True, default=str)}"
+        )
+        verification = self._build_vetting(
+            endpoint=mcp_url,
+            homepage=homepage,
+            auth_requirement=auth_requirement,
+            source_count=1,
+        )
         return {
             "source": source,
             "name": name,
@@ -917,6 +1142,9 @@ class AnthropicAgentSDKRuntime:
             "homepage": homepage,
             "tags": tags,
             "updated_at": updated_at,
+            "auth_requirement": auth_requirement,
+            "auth_evidence": auth_evidence,
+            "verification": verification,
             "raw": item,
         }
 
@@ -940,47 +1168,85 @@ class AnthropicAgentSDKRuntime:
                 last_error = {"source": "official_registry", "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}}
         return [], {"ok": False, "source": "official_registry", "error": last_error or {"message": "unavailable"}}
 
-    def _discover_from_smithery(self, *, query: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        encoded = urllib.parse.quote_plus(query)
-        urls = [
-            f"https://api.smithery.ai/servers?q={encoded}&limit={limit}",
-            f"https://api.smithery.ai/servers?query={encoded}&limit={limit}",
-            "https://api.smithery.ai/servers",
+    def _discover_from_mcpmarket(self, *, query: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        topic = str(query or "").strip()
+        encoded = urllib.parse.quote(topic, safe="")
+        search_urls = [
+            f"https://mcpmarket.com/search/{encoded}",
+            f"https://mcpmarket.com/search?q={urllib.parse.quote_plus(topic)}",
         ]
-        headers: Dict[str, str] = {}
-        if self.smithery_api_key:
-            headers["Authorization"] = f"Bearer {self.smithery_api_key}"
-        last_error: Dict[str, Any] | None = None
-        for url in urls:
-            try:
-                payload = self._http_json_get(url=url, headers=headers)
-                items = self._extract_items(payload)
-                normalized = [self._normalize_discovery_item(source="smithery", item=item) for item in items]
-                if query.strip():
-                    normalized = self._filter_discovery_items_by_query(normalized, query=query)
-                return normalized[:limit], {"ok": True, "source": "smithery", "url": url}
-            except RegistryError as exc:
-                last_error = {"source": "smithery", "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}}
-        return [], {"ok": False, "source": "smithery", "error": last_error or {"message": "unavailable"}}
+        link_limit = max(4, min(12, limit * 3))
+        server_links: List[str] = []
+        seen_links = set()
+        search_reports: List[Dict[str, Any]] = []
 
-    def _discover_from_mcp_so(self, *, query: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        encoded = urllib.parse.quote_plus(query)
-        urls = [
-            f"https://mcp.so/api/search?q={encoded}",
-            f"https://mcp.so/api/servers?q={encoded}&limit={limit}",
-        ]
-        last_error: Dict[str, Any] | None = None
-        for url in urls:
+        for search_url in search_urls:
             try:
-                payload = self._http_json_get(url=url)
-                items = self._extract_items(payload)
-                normalized = [self._normalize_discovery_item(source="mcp_so", item=item) for item in items]
-                if query.strip():
-                    normalized = self._filter_discovery_items_by_query(normalized, query=query)
-                return normalized[:limit], {"ok": True, "source": "mcp_so", "url": url}
+                html_text = self._http_text_get(url=search_url, timeout_seconds=self.mcp_discovery_timeout_seconds)
+                links = self._extract_mcpmarket_server_links(html_text, limit=link_limit)
+                for link in links:
+                    if link in seen_links:
+                        continue
+                    seen_links.add(link)
+                    server_links.append(link)
+                    if len(server_links) >= link_limit:
+                        break
+                search_reports.append(
+                    {
+                        "ok": True,
+                        "source": "mcpmarket",
+                        "url": search_url,
+                        "server_link_count": len(links),
+                    }
+                )
+                if len(server_links) >= link_limit:
+                    break
             except RegistryError as exc:
-                last_error = {"source": "mcp_so", "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}}
-        return [], {"ok": False, "source": "mcp_so", "error": last_error or {"message": "unavailable"}}
+                search_reports.append(
+                    {
+                        "ok": False,
+                        "source": "mcpmarket",
+                        "url": search_url,
+                        "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)},
+                    }
+                )
+
+        if not server_links:
+            return [], {
+                "ok": False,
+                "source": "mcpmarket",
+                "error": {"message": "No MCP Market server links discovered from search pages"},
+                "search_reports": search_reports,
+            }
+
+        candidates: List[Dict[str, Any]] = []
+        page_reports: List[Dict[str, Any]] = []
+        for server_url in server_links[:link_limit]:
+            try:
+                page_html = self._http_text_get(url=server_url, timeout_seconds=self.mcp_discovery_timeout_seconds)
+                candidate = self._normalize_mcpmarket_page(page_url=server_url, html_text=page_html)
+                if str(candidate.get("name") or "").strip() or str(candidate.get("mcp_url") or "").strip():
+                    candidates.append(candidate)
+                page_reports.append({"ok": True, "source": "mcpmarket", "url": server_url})
+            except RegistryError as exc:
+                page_reports.append(
+                    {
+                        "ok": False,
+                        "source": "mcpmarket",
+                        "url": server_url,
+                        "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)},
+                    }
+                )
+
+        if topic:
+            candidates = self._filter_discovery_items_by_query(candidates, query=topic)
+
+        return candidates[:limit], {
+            "ok": bool(candidates),
+            "source": "mcpmarket",
+            "search_reports": search_reports,
+            "page_reports": page_reports,
+        }
 
     @staticmethod
     def _topic_tokens(query: str) -> List[str]:
@@ -1013,16 +1279,69 @@ class AnthropicAgentSDKRuntime:
         return filtered
 
     def _dedupe_discovery_candidates(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        seen = set()
-        output: List[Dict[str, Any]] = []
+        by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         for row in rows:
             name = str(row.get("name") or "").strip().casefold()
             mcp_url = str(row.get("mcp_url") or "").strip().casefold()
-            key = (name, mcp_url)
-            if key in seen:
+            homepage = str(row.get("homepage") or "").strip().casefold()
+            key = (name, mcp_url, homepage)
+            if key not in by_key:
+                item = dict(row)
+                source = str(item.get("source") or "").strip()
+                item["sources"] = [source] if source else []
+                by_key[key] = item
                 continue
-            seen.add(key)
-            output.append(row)
+            current = by_key[key]
+            source = str(row.get("source") or "").strip()
+            sources = current.get("sources") if isinstance(current.get("sources"), list) else []
+            if source and source not in sources:
+                sources.append(source)
+                current["sources"] = sources
+
+            if not str(current.get("description") or "").strip():
+                current["description"] = str(row.get("description") or "").strip()
+            if not str(current.get("homepage") or "").strip():
+                current["homepage"] = str(row.get("homepage") or "").strip()
+            if not str(current.get("mcp_url") or "").strip():
+                current["mcp_url"] = str(row.get("mcp_url") or "").strip()
+            current_tags = current.get("tags") if isinstance(current.get("tags"), list) else []
+            for tag in row.get("tags") if isinstance(row.get("tags"), list) else []:
+                if tag not in current_tags:
+                    current_tags.append(tag)
+            current["tags"] = current_tags
+
+            auth_set = {
+                str(current.get("auth_requirement") or "").strip(),
+                str(row.get("auth_requirement") or "").strip(),
+            }
+            if "auth_required" in auth_set and "no_auth_required" in auth_set:
+                current["auth_requirement"] = "unknown"
+            elif "auth_required" in auth_set:
+                current["auth_requirement"] = "auth_required"
+            elif "no_auth_required" in auth_set:
+                current["auth_requirement"] = "no_auth_required"
+            else:
+                current["auth_requirement"] = "unknown"
+
+            evidence = current.get("auth_evidence") if isinstance(current.get("auth_evidence"), list) else []
+            for token in row.get("auth_evidence") if isinstance(row.get("auth_evidence"), list) else []:
+                if token not in evidence:
+                    evidence.append(token)
+            current["auth_evidence"] = evidence
+            by_key[key] = current
+
+        output: List[Dict[str, Any]] = []
+        for item in by_key.values():
+            sources = item.get("sources") if isinstance(item.get("sources"), list) else []
+            source_count = max(1, len(sources))
+            item["verification"] = self._build_vetting(
+                endpoint=str(item.get("mcp_url") or "").strip(),
+                homepage=str(item.get("homepage") or "").strip(),
+                auth_requirement=str(item.get("auth_requirement") or "unknown").strip() or "unknown",
+                source_count=source_count,
+            )
+            item["source_count"] = source_count
+            output.append(item)
         return output
 
     def _existing_coverage_candidates(self, *, query: str) -> List[Dict[str, Any]]:
@@ -1079,8 +1398,7 @@ class AnthropicAgentSDKRuntime:
     ) -> List[Dict[str, Any]]:
         trust_weights = {
             "official_registry": 35,
-            "smithery": 25,
-            "mcp_so": 10,
+            "mcpmarket": 20,
         }
         tokens = self._topic_tokens(query)
         existing = self._server_rows_for_runtime(enabled_only=None)
@@ -1108,6 +1426,17 @@ class AnthropicAgentSDKRuntime:
                 score -= 20
                 reasons.append("endpoint_missing_or_non_http")
 
+            verification = item.get("verification") if isinstance(item.get("verification"), dict) else {}
+            verification_score = int(verification.get("score") or 0)
+            if verification_score > 0:
+                score += min(25, verification_score // 4)
+                reasons.append(f"verification:{verification_score}")
+
+            source_count = int(item.get("source_count") or 1)
+            if source_count > 1:
+                score += min(12, (source_count - 1) * 6)
+                reasons.append(f"cross_source_verified:{source_count}")
+
             match_count = 0
             for token in tokens:
                 if token in text:
@@ -1115,6 +1444,17 @@ class AnthropicAgentSDKRuntime:
             if match_count:
                 score += min(40, match_count * 12)
                 reasons.append(f"topic_match:{match_count}")
+
+            auth_requirement = str(item.get("auth_requirement") or "unknown").strip() or "unknown"
+            if auth_requirement == "no_auth_required":
+                score += 8
+                reasons.append("auth:no_auth_required")
+            elif auth_requirement == "auth_required":
+                score += 0
+                reasons.append("auth:auth_required")
+            else:
+                score -= 4
+                reasons.append("auth:unknown")
 
             already_registered = False
             if name and name.casefold() in existing_by_name:
@@ -1152,12 +1492,9 @@ class AnthropicAgentSDKRuntime:
         official_rows, official_report = self._discover_from_official_registry(query=query, limit=limit * 3)
         rows.extend(official_rows)
         source_reports.append(official_report)
-        smithery_rows, smithery_report = self._discover_from_smithery(query=query, limit=limit * 3)
-        rows.extend(smithery_rows)
-        source_reports.append(smithery_report)
-        mcp_so_rows, mcp_so_report = self._discover_from_mcp_so(query=query, limit=limit * 3)
-        rows.extend(mcp_so_rows)
-        source_reports.append(mcp_so_report)
+        mcpmarket_rows, mcpmarket_report = self._discover_from_mcpmarket(query=query, limit=limit * 3)
+        rows.extend(mcpmarket_rows)
+        source_reports.append(mcpmarket_report)
         rows = self._dedupe_discovery_candidates(rows)
         ranked = self._score_discovery_candidates(query=query, candidates=rows)
         return ranked[: max(1, int(limit))], source_reports
@@ -1271,8 +1608,8 @@ class AnthropicAgentSDKRuntime:
         @sdk_tool(
             "mcp_server_discover",
             (
-                "Discover candidate MCP servers from public registries (Official MCP Registry first, "
-                "then Smithery, then MCP.so), rank by relevance/trust/operability, and return recommendations."
+                "Discover candidate MCP servers using Official MCP Registry and MCP Market discovery pages, "
+                "rank by relevance/trust/operability, and include authenticity + auth requirement vetting."
             ),
             input_schema,
         )
@@ -1320,6 +1657,8 @@ class AnthropicAgentSDKRuntime:
                     "mcp_url": str(top.get("mcp_url") or "").strip(),
                     "source": str(top.get("source") or "").strip(),
                     "score": int(top.get("score") or 0),
+                    "auth_requirement": str(top.get("auth_requirement") or "unknown").strip() or "unknown",
+                    "verification": top.get("verification") if isinstance(top.get("verification"), dict) else {},
                     "reason": "Top-ranked candidate by trust/relevance/operability.",
                 }
 

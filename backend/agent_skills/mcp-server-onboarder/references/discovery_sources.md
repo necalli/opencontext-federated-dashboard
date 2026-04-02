@@ -3,8 +3,7 @@
 Use this priority order for MCP discovery:
 
 1. Official MCP Registry
-2. Smithery
-3. MCP.so (supplementary)
+2. MCP Market (supplementary with page-level vetting)
 
 ## 1) Official MCP Registry
 
@@ -16,30 +15,26 @@ Use this priority order for MCP discovery:
 
 Rationale: community-governed and aligned with MCP ecosystem defaults.
 
-## 2) Smithery
+## 2) MCP Market
 
-- Base: `https://api.smithery.ai`
-- Try:
-  - `/servers?q=<topic>&limit=<n>`
-  - `/servers?query=<topic>&limit=<n>`
-  - `/servers` (client-side filter)
+- Base: `https://mcpmarket.com`
+- Discovery pages:
+  - `/search/<topic>`
+  - `/search?q=<topic>`
+- Candidate pages:
+  - `/server/<slug>`
 
-Auth:
+Vetting expectations:
 
-- Optional `SMITHERY_API_KEY` via Bearer token when available.
-
-## 3) MCP.so
-
-- Supplementary source for long-tail discovery.
-- Try:
-  - `/api/search?q=<topic>`
-  - `/api/servers?q=<topic>&limit=<n>`
-
-Use MCP.so results as lower trust than official registry entries.
+- Extract and validate an MCP endpoint candidate (`https://.../mcp` preferred).
+- Identify auth hints (`no_auth_required`, `auth_required`, or `unknown`).
+- Cross-check linked homepage/repository (for example GitHub) before recommending.
+- Treat MCP Market results as lower trust than official registry entries.
 
 ## Recommendation Rules
 
 1. Prefer already-enabled local servers when they match topic intent.
 2. Prefer candidates with explicit HTTP MCP endpoint URL.
 3. Prefer official registry candidates over third-party listings.
-4. Do not onboard until user confirms.
+4. Include auth determination and verification score in each recommendation.
+5. Do not onboard until user confirms.
