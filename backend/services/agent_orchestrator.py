@@ -33,7 +33,9 @@ class AgentOrchestrator:
                     "Use generic get_data only when alias-specific tools are unavailable. "
                     "When user asks to add/connect/onboard an MCP server, execute the MCP onboarding flow: "
                     "first discover candidates and recommend options, then wait for explicit user confirmation, "
-                    "then upsert server registration, run MCP connection test, verify tools are listed for that server, "
+                    "if candidate onboarding_mode is stdio_bridge_required, generate and use a bridge plan first "
+                    "(mcp_stdio_bridge_plan), run the bridge, then onboard the local HTTP endpoint; "
+                    "otherwise onboard directly. After onboarding, run MCP connection test, verify tools are listed for that server, "
                     "and report pass/fail with actionable remediation. "
                     "If user intent is ambiguous across servers, ask a clarifying question before deep analysis."
                 ),
