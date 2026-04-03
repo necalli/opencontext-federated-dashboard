@@ -217,6 +217,24 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
         self.assertIn("beta", names)
         self.assertIn("gamma", names)
 
+    def test_extract_official_registry_records_handles_nested_server_object_name(self) -> None:
+        with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
+            runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
+            records, names = runtime._extract_official_registry_records(
+                {
+                    "servers": [
+                        {
+                            "server": {
+                                "name": "@acme/example-mcp",
+                                "description": "Example",
+                            }
+                        }
+                    ]
+                }
+            )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(names, ["@acme/example-mcp"])
+
 
 if __name__ == "__main__":
     unittest.main()
