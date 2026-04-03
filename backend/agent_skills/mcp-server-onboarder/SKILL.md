@@ -9,6 +9,7 @@ description: >
 # MCP Server Onboarder
 
 Use this workflow whenever the user asks to add or connect a new MCP server.
+This includes follow-up requests in the same chat session (for example: "add another server").
 
 ## Preferred Tools
 
@@ -23,6 +24,17 @@ Use this workflow whenever the user asks to add or connect a new MCP server.
 - `mcp_stdio_bridge_start`
 - `mcp_stdio_bridge_status`
 - `mcp_stdio_bridge_stop`
+
+## Grounding Rules (Mandatory)
+
+1. Every onboarding cycle must begin with a real `mcp_servers_list` tool call.
+2. Never claim tool availability, tool absence, or server status from memory alone.
+3. If you state a tool is unavailable, include the exact error from a current-turn tool call attempt.
+4. For "add another server" in the same session, restart from Step 1 and re-check current registry state.
+5. Do not provide manual shell fallback steps unless:
+   - the user explicitly asks for manual mode, or
+   - a required tool call fails and you include the exact failure.
+6. If a response was generated without onboarding tool calls, do not continue onboarding logic. Retry with explicit tool calls first.
 
 ## Goals
 
@@ -64,6 +76,14 @@ If endpoint is missing or ambiguous, ask one short clarifying question.
 7. Report:
    - Provide a concise operator summary (status, server id/name, tool count, errors/remediation).
 
+## Same-Session Multi-Server Rule
+
+When the user asks to onboard an additional server after a successful onboarding in the same chat:
+
+1. Run a fresh `mcp_servers_list` again (do not reuse prior results).
+2. Treat the next server as a brand-new onboarding cycle.
+3. Require new discovery/test/tool-list evidence for the new server before reporting success.
+
 ## Safety Rules
 
 1. Do not invent endpoints, headers, or auth tokens.
@@ -87,6 +107,7 @@ Use this output format:
 - `tool_count`: `<n>`
 - `actions_taken`: `<created/updated/disabled>`
 - `next_step`: `<operator action>`
+- `grounding`: `<tools_executed + current-turn evidence>`
 
 If failed, include `error.code`, `error.message`, and one remediation bullet.
 
