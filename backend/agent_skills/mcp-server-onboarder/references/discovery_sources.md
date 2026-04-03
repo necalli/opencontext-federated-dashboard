@@ -9,11 +9,15 @@ Use this priority order for MCP discovery:
 
 - Base: `https://registry.modelcontextprotocol.io`
 - Try:
-  - `/v0/servers?query=<topic>&limit=<n>`
-  - `/v0/servers?q=<topic>&limit=<n>`
-  - `/v0/servers` (client-side filter)
+  - `/v0.1/servers?q=<topic>&limit=<n>`
+  - `/v0.1/servers?query=<topic>&limit=<n>`
+  - `/v0.1/servers` (client-side filter)
+  - For each candidate server name, resolve details from:
+    - `/v0.1/servers/{name}/versions/latest`
+    - fallback `/v0.1/servers/{name}/versions`
 
 Rationale: community-governed and aligned with MCP ecosystem defaults.
+Important: many entries are `stdio` local-process transports; treat those as discovery-only unless you run a bridge.
 
 ## 2) MCP Market
 
@@ -34,7 +38,7 @@ Vetting expectations:
 ## Recommendation Rules
 
 1. Prefer already-enabled local servers when they match topic intent.
-2. Prefer candidates with explicit HTTP MCP endpoint URL.
+2. Prefer candidates with explicit remote HTTP/SSE MCP endpoint URL.
 3. Prefer official registry candidates over third-party listings.
 4. Include auth determination and verification score in each recommendation.
 5. Do not onboard until user confirms.
