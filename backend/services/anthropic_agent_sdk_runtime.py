@@ -1161,6 +1161,25 @@ class AnthropicAgentSDKRuntime:
         return ""
 
     @staticmethod
+    def _extract_registry_server_name(item: Dict[str, Any]) -> str:
+        if not isinstance(item, dict):
+            return ""
+        direct = str(item.get("name") or item.get("serverName") or item.get("qualifiedName") or "").strip()
+        if direct:
+            return direct
+        server_block = item.get("server")
+        if isinstance(server_block, dict):
+            nested = str(
+                server_block.get("name")
+                or server_block.get("serverName")
+                or server_block.get("qualifiedName")
+                or ""
+            ).strip()
+            if nested:
+                return nested
+        return ""
+
+    @staticmethod
     def _extract_official_registry_records(payload: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
         records: List[Dict[str, Any]] = []
         names: List[str] = []
@@ -1171,13 +1190,7 @@ class AnthropicAgentSDKRuntime:
             for row in rows:
                 if isinstance(row, dict):
                     records.append(row)
-                    name = str(
-                        row.get("name")
-                        or row.get("server")
-                        or row.get("id")
-                        or row.get("qualifiedName")
-                        or ""
-                    ).strip()
+                    name = AnthropicAgentSDKRuntime._extract_registry_server_name(row)
                     if name:
                         names.append(name)
                 elif isinstance(row, str):
@@ -1203,7 +1216,9 @@ class AnthropicAgentSDKRuntime:
 
         if isinstance(payload.get("name"), str):
             records.append(payload)
-            names.append(str(payload.get("name") or "").strip())
+            name = AnthropicAgentSDKRuntime._extract_registry_server_name(payload)
+            if name:
+                names.append(name)
 
         deduped_names: List[str] = []
         seen = set()
@@ -1251,15 +1266,17 @@ class AnthropicAgentSDKRuntime:
         }
 
     def _discover_from_official_registry(self, *, query: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        encoded = urllib.parse.quote_plus(str(query or "").strip())
+        topic = str(query or "").strip()
+        encoded = urllib.parse.quote_plus(topic)
         fetch_limit = max(5, min(50, int(limit)))
         base = "https://registry.modelcontextprotocol.io/v0.1/servers"
-        urls = [
-            f"{base}?q={encoded}&limit={fetch_limit}",
-            f"{base}?query={encoded}&limit={fetch_limit}",
-            f"{base}?search={encoded}&limit={fetch_limit}",
-            f"{base}?limit={fetch_limit}",
-        ]
+        urls: List[str] = []
+        if topic:
+            urls.append(f"{base}?search={encoded}&version=latest&limit={fetch_limit}")
+            urls.append(f"{base}?search={encoded}&limit={fetch_limit}")
+        else:
+            urls.append(f"{base}?version=latest&limit={fetch_limit}")
+        urls.append(f"{base}?limit={fetch_limit}")
         last_error: Dict[str, Any] | None = None
         list_payload: Any = None
         list_url = ""
