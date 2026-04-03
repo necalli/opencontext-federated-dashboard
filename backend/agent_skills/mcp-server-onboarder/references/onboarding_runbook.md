@@ -8,9 +8,10 @@ This runbook defines pass/fail criteria for MCP server onboarding.
 2. `mcp_server_discover`
 3. User confirmation on selected option
 4. If recommendation indicates `stdio_bridge_required`:
-   - Run `mcp_stdio_bridge_plan`
-   - Start bridge process
-   - Use bridged local endpoint for onboarding
+   - Prefer `mcp_stdio_bridge_start` (`auto_onboard=true`, `confirmed=true`)
+   - Optionally use `mcp_stdio_bridge_status` to verify runtime health
+   - If needed, use `mcp_stdio_bridge_stop` for cleanup/retry
+   - Fallback: run `mcp_stdio_bridge_plan` for manual steps
 5. `mcp_server_onboard` with `confirmed=true`
 6. `mcp_tools_list_by_server`
 7. Optional failure path:
@@ -46,7 +47,7 @@ If onboarding fails:
 
 1. Confirm endpoint path includes `/mcp`.
 2. Confirm auth header names and token source (`headers_env` variables exist).
-3. If server is stdio-only, generate/validate bridge plan with `mcp_stdio_bridge_plan` and confirm bridge is running.
+3. If server is stdio-only, run `mcp_stdio_bridge_start` (or `mcp_stdio_bridge_plan` fallback) and confirm bridge is running.
 4. Re-run `mcp_server_test`.
 5. If still failing and user requests rollback, run `mcp_server_disable`.
 

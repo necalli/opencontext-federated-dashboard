@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import html
+import importlib.util
 import inspect
 import json
 import os
 import re
 import shutil
+import subprocess
+import sys
+import time
 import uuid
 import urllib.error
 import urllib.parse
@@ -90,6 +94,9 @@ MCP_ONBOARDING_TOOL_NAMES: Tuple[str, ...] = (
     "mcp_tools_list_by_server",
     "mcp_server_disable",
     "mcp_stdio_bridge_plan",
+    "mcp_stdio_bridge_start",
+    "mcp_stdio_bridge_status",
+    "mcp_stdio_bridge_stop",
 )
 
 
@@ -180,7 +187,11 @@ class AnthropicAgentSDKRuntime:
             str(os.getenv("AGENT_SKILLS_DIR", str(self.project_root / "backend" / "agent_skills"))).strip()
         )
         self.native_skill_target_dir = self.project_root / ".claude" / "skills"
+        self.bridge_runtime_dir = Path(
+            str(os.getenv("AGENT_SDK_BRIDGE_RUNTIME_DIR", str(self.project_root / ".runtime_bridges"))).strip()
+        )
         self._session_map: Dict[str, str] = {}
+        self._bridge_processes: Dict[str, Dict[str, Any]] = {}
 
         self.client_factory = client_factory or OpenContextMCPClient
         self.tool_router = tool_router or ToolRouter(client_factory=self.client_factory)
@@ -768,6 +779,12 @@ class AnthropicAgentSDKRuntime:
             return self._build_mcp_server_disable_tool(event_sink=event_sink)
         if tool_name == "mcp_stdio_bridge_plan":
             return self._build_mcp_stdio_bridge_plan_tool(event_sink=event_sink)
+        if tool_name == "mcp_stdio_bridge_start":
+            return self._build_mcp_stdio_bridge_start_tool(event_sink=event_sink)
+        if tool_name == "mcp_stdio_bridge_status":
+            return self._build_mcp_stdio_bridge_status_tool(event_sink=event_sink)
+        if tool_name == "mcp_stdio_bridge_stop":
+            return self._build_mcp_stdio_bridge_stop_tool(event_sink=event_sink)
         if tool_name == "mcp_server_onboard":
             return self._build_mcp_server_onboard_tool(event_sink=event_sink)
         raise ValueError(f"Unsupported MCP onboarding tool: {tool_name}")
@@ -1342,6 +1359,317 @@ class AnthropicAgentSDKRuntime:
             env=launch.get("env") if isinstance(launch.get("env"), dict) else {},
             bridge_port=bridge_port,
         )
+
+    def _bridge_runtime_key(self, name: str) -> str:
+        return self._slugify(name)
+
+    def _ensure_bridge_runtime_dir(self) -> None:
+        self.bridge_runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _tail_text_file(path: str, max_lines: int = 80) -> str:
+        target = str(path or "").strip()
+        if not target:
+            return ""
+        try:
+            lines = Path(target).read_text(encoding="utf-8", errors="ignore").splitlines()
+            return "\n".join(lines[-max(1, int(max_lines)) :])
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _http_json_post(url: str, payload: Dict[str, Any], timeout_seconds: float) -> Tuple[int, str]:
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+                return int(getattr(resp, "status", 200) or 200), text
+        except urllib.error.HTTPError as exc:
+            text = ""
+            try:
+                text = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                text = str(exc)
+            return int(exc.code), text
+
+    def _probe_bridge_health(self, endpoint: str, timeout_seconds: float = 8.0) -> Dict[str, Any]:
+        url = str(endpoint or "").strip()
+        if not url:
+            return {"ok": False, "status": 0, "error": "missing_endpoint"}
+        init_payload = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "clientInfo": {"name": "bridge-health", "version": "0.1.0"},
+                "capabilities": {"tools": {}},
+            },
+        }
+        try:
+            status, text = self._http_json_post(url, init_payload, timeout_seconds=timeout_seconds)
+            ok = status < 500 and status > 0
+            return {
+                "ok": bool(ok),
+                "status": int(status),
+                "body_preview": str(text or "")[:400],
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": 0,
+                "error": str(exc),
+            }
+
+    @staticmethod
+    def _bridge_process_running(record: Dict[str, Any]) -> bool:
+        proc = record.get("process")
+        if proc is None:
+            return False
+        try:
+            return proc.poll() is None
+        except Exception:
+            return False
+
+    def _wait_for_bridge_ready(
+        self,
+        *,
+        record: Dict[str, Any],
+        timeout_seconds: float,
+    ) -> Dict[str, Any]:
+        start = time.time()
+        endpoint = str(record.get("endpoint") or "").strip()
+        while time.time() - start < max(1.0, float(timeout_seconds)):
+            proc = record.get("process")
+            if proc is not None:
+                try:
+                    if proc.poll() is not None:
+                        return {
+                            "ok": False,
+                            "error": f"bridge_process_exited:{proc.poll()}",
+                            "log_tail": self._tail_text_file(str(record.get("log_path") or ""), max_lines=80),
+                        }
+                except Exception:
+                    pass
+            health = self._probe_bridge_health(endpoint, timeout_seconds=4.0)
+            if bool(health.get("ok")):
+                return {"ok": True, "health": health}
+            time.sleep(1.0)
+        return {
+            "ok": False,
+            "error": "bridge_start_timeout",
+            "health": self._probe_bridge_health(endpoint, timeout_seconds=4.0),
+            "log_tail": self._tail_text_file(str(record.get("log_path") or ""), max_lines=80),
+        }
+
+    def _start_or_reuse_bridge(
+        self,
+        *,
+        name: str,
+        command: str,
+        args: List[str],
+        env: Dict[str, str] | None,
+        bridge_host: str,
+        bridge_port: int,
+        bridge_path: str,
+        wait_seconds: float,
+        restart_if_running: bool,
+    ) -> Dict[str, Any]:
+        if importlib.util.find_spec("mcp_http_bridge.main") is None:
+            raise RegistryError(
+                "bridge_dependency_missing",
+                "mcp-http-bridge is not installed in backend runtime",
+                details={"pip_install": "python -m pip install mcp-http-bridge"},
+            )
+
+        safe_name = str(name or "").strip()
+        if not safe_name:
+            raise RegistryError("validation_error", "name is required")
+
+        plan = self._build_stdio_bridge_plan(
+            server_name=safe_name,
+            command=command,
+            args=args,
+            env=env,
+            bridge_host=bridge_host,
+            bridge_port=bridge_port,
+            bridge_path=bridge_path,
+        )
+
+        key = self._bridge_runtime_key(safe_name)
+        existing = self._bridge_processes.get(key) if isinstance(self._bridge_processes.get(key), dict) else None
+        if existing and self._bridge_process_running(existing):
+            if not restart_if_running:
+                return {"ok": True, "action": "reused", "bridge": self._serialize_bridge_record(existing), "plan": plan}
+            self._stop_bridge_record(existing)
+
+        self._ensure_bridge_runtime_dir()
+        config_path = str(plan.get("config_path_suggestion") or "").strip()
+        if not config_path:
+            config_path = str(self.bridge_runtime_dir / f"{key}.json")
+        else:
+            config_path = str(self.bridge_runtime_dir / Path(config_path).name)
+        log_path = str(self.bridge_runtime_dir / f"{key}.log")
+        Path(config_path).write_text(
+            json.dumps(plan.get("config") if isinstance(plan.get("config"), dict) else {}, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
+        cmd = [
+            sys.executable,
+            "-m",
+            "mcp_http_bridge.main",
+            "--config",
+            config_path,
+            "--host",
+            str(bridge_host or "0.0.0.0"),
+            "--port",
+            str(int(bridge_port)),
+            "--path",
+            str(bridge_path or "/mcp"),
+        ]
+        env_vars = os.environ.copy()
+        extra_env = env if isinstance(env, dict) else {}
+        for k, v in extra_env.items():
+            key_name = str(k or "").strip()
+            if key_name:
+                env_vars[key_name] = str(v or "")
+        with open(log_path, "a", encoding="utf-8", errors="ignore") as log_file:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=log_file,
+                cwd=str(self.project_root),
+                env=env_vars,
+                start_new_session=True,
+            )
+
+        record = {
+            "key": key,
+            "name": safe_name,
+            "endpoint": str(plan.get("local_endpoint") or "").strip(),
+            "config_path": config_path,
+            "log_path": log_path,
+            "pid": int(proc.pid),
+            "process": proc,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "command": cmd,
+            "plan": plan,
+        }
+        self._bridge_processes[key] = record
+        readiness = self._wait_for_bridge_ready(record=record, timeout_seconds=max(5.0, float(wait_seconds)))
+        if not bool(readiness.get("ok")):
+            self._stop_bridge_record(record)
+            raise RegistryError(
+                "bridge_start_failed",
+                "Bridge failed to become ready",
+                details={
+                    "bridge": self._serialize_bridge_record(record),
+                    "readiness": readiness,
+                },
+            )
+        return {
+            "ok": True,
+            "action": "started",
+            "bridge": self._serialize_bridge_record(record),
+            "plan": plan,
+            "health": readiness.get("health"),
+        }
+
+    def _serialize_bridge_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        payload = {
+            "name": str(record.get("name") or "").strip(),
+            "key": str(record.get("key") or "").strip(),
+            "endpoint": str(record.get("endpoint") or "").strip(),
+            "config_path": str(record.get("config_path") or "").strip(),
+            "log_path": str(record.get("log_path") or "").strip(),
+            "pid": int(record.get("pid") or 0),
+            "started_at": str(record.get("started_at") or "").strip(),
+            "running": self._bridge_process_running(record),
+        }
+        if payload["running"]:
+            payload["health"] = self._probe_bridge_health(payload["endpoint"], timeout_seconds=4.0)
+        return payload
+
+    def _stop_bridge_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        proc = record.get("process")
+        terminated = False
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=4)
+                    except Exception:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                terminated = True
+            except Exception:
+                terminated = False
+        key = str(record.get("key") or "").strip()
+        if key and key in self._bridge_processes:
+            self._bridge_processes.pop(key, None)
+        payload = self._serialize_bridge_record(record)
+        payload["terminated"] = terminated
+        payload["log_tail"] = self._tail_text_file(str(record.get("log_path") or ""), max_lines=80)
+        return payload
+
+    def _perform_onboard(
+        self,
+        *,
+        name: str,
+        endpoint: str,
+        description: str,
+        enabled: bool,
+        headers: Dict[str, str],
+        disable_on_failed_test: bool,
+    ) -> Dict[str, Any]:
+        upserted = self._upsert_server_from_payload(
+            {
+                "name": str(name or "").strip(),
+                "endpoint": str(endpoint or "").strip(),
+                "description": str(description or "").strip(),
+                "enabled": bool(enabled),
+                "headers": headers,
+            }
+        )
+        server = upserted.get("server") if isinstance(upserted.get("server"), dict) else {}
+        server_id = str(server.get("id") or "").strip()
+        registry = self._registry_service()
+        test_result = registry.test_connection(server_id)
+        tools_result: Dict[str, Any] = {"ok": False, "tool_count": 0, "tools": [], "errors": []}
+        if bool(test_result.get("ok")):
+            rows = [registry.get_server_internal(server_id)]
+            catalog = self.tool_router.build_catalog(rows)
+            tools_result = {
+                "ok": len(catalog.errors) == 0,
+                "tool_count": len(catalog.tools),
+                "tools": catalog.tools,
+                "errors": catalog.errors,
+            }
+
+        disabled_after_failure = False
+        if disable_on_failed_test and not bool(test_result.get("ok")):
+            registry.update_server(server_id, {"enabled": False})
+            disabled_after_failure = True
+
+        overall_ok = bool(test_result.get("ok")) and int(tools_result.get("tool_count") or 0) > 0
+        return {
+            "ok": overall_ok,
+            "action": str(upserted.get("action") or ""),
+            "server": registry.get_server(server_id),
+            "test_result": test_result,
+            "tools_result": tools_result,
+            "disabled_after_failure": disabled_after_failure,
+        }
 
     @staticmethod
     def _extract_registry_server_name(item: Dict[str, Any]) -> str:
@@ -2125,7 +2453,8 @@ class AnthropicAgentSDKRuntime:
                 "source_reports": source_reports,
                 "next_step": (
                     "Confirm the recommended option. For direct_http candidates call mcp_server_onboard with confirmed=true. "
-                    "For stdio_bridge_required candidates use mcp_stdio_bridge_plan (or provided bridge_plan), run the bridge, then onboard local endpoint."
+                    "For stdio_bridge_required candidates prefer mcp_stdio_bridge_start with auto_onboard=true and confirmed=true "
+                    "(or use mcp_stdio_bridge_plan for manual bridge steps)."
                     if recommendation is not None
                     else "No strong candidates found. Refine query or provide an endpoint manually."
                 ),
@@ -2221,6 +2550,286 @@ class AnthropicAgentSDKRuntime:
             return self._tool_text_response(response, is_error=False)
 
         return _mcp_stdio_bridge_plan
+
+    def _build_mcp_stdio_bridge_start_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "command": {"type": "string"},
+                "args": {"type": "array", "items": {"type": "string"}},
+                "env": {"type": "object"},
+                "package_name": {"type": "string"},
+                "bridge_host": {"type": "string"},
+                "bridge_port": {"type": "integer"},
+                "bridge_path": {"type": "string"},
+                "wait_seconds": {"type": "integer"},
+                "restart_if_running": {"type": "boolean"},
+                "auto_onboard": {"type": "boolean"},
+                "description": {"type": "string"},
+                "enabled": {"type": "boolean"},
+                "headers": {"type": "object"},
+                "headers_env": {"type": "object"},
+                "disable_on_failed_test": {"type": "boolean"},
+                "confirmed": {"type": "boolean"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_stdio_bridge_start",
+            (
+                "Start or reuse a stdio->HTTP bridge process for a stdio MCP server. "
+                "Can auto-onboard the bridged endpoint after health check."
+            ),
+            input_schema,
+        )
+        async def _mcp_stdio_bridge_start(args: Any) -> Dict[str, Any]:
+            payload = args if isinstance(args, dict) else {}
+            name = str(payload.get("name") or "").strip()
+            if not name:
+                return self._tool_text_response(
+                    {"ok": False, "error": {"code": "validation_error", "message": "name is required"}},
+                    is_error=True,
+                )
+
+            command = str(payload.get("command") or "").strip()
+            args_value = payload.get("args") if isinstance(payload.get("args"), list) else []
+            command_args = [str(value or "").strip() for value in args_value if str(value or "").strip()]
+            package_name = str(payload.get("package_name") or "").strip()
+            if not command and package_name:
+                command = "npx"
+                command_args = ["-y", package_name]
+            if not command:
+                return self._tool_text_response(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "missing_stdio_launch",
+                            "message": "Provide command/args or package_name to start bridge.",
+                        },
+                    },
+                    is_error=True,
+                )
+
+            env_map = payload.get("env") if isinstance(payload.get("env"), dict) else {}
+            try:
+                bridge_result = self._start_or_reuse_bridge(
+                    name=name,
+                    command=command,
+                    args=command_args,
+                    env={str(k): str(v) for k, v in env_map.items() if str(k or "").strip()},
+                    bridge_host=str(payload.get("bridge_host") or "").strip() or "0.0.0.0",
+                    bridge_port=max(1, min(65535, _to_int(payload.get("bridge_port"), 8300))),
+                    bridge_path=str(payload.get("bridge_path") or "").strip() or "/mcp",
+                    wait_seconds=max(5, _to_int(payload.get("wait_seconds"), 35)),
+                    restart_if_running=_to_bool(payload.get("restart_if_running"), False),
+                )
+            except RegistryError as exc:
+                return self._tool_text_response(
+                    {"ok": False, "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}},
+                    is_error=True,
+                )
+
+            auto_onboard = _to_bool(payload.get("auto_onboard"), True)
+            response: Dict[str, Any] = {
+                "ok": True,
+                "bridge": bridge_result.get("bridge"),
+                "bridge_action": str(bridge_result.get("action") or ""),
+                "bridge_health": bridge_result.get("health"),
+            }
+            if not auto_onboard:
+                response["next_step"] = (
+                    "Bridge is running. Call mcp_server_onboard with endpoint="
+                    f"{(bridge_result.get('bridge') or {}).get('endpoint')}"
+                )
+                self._emit_event(
+                    event_sink,
+                    {"event": "mcp_onboarding", "payload": {"action": "start_stdio_bridge", "name": name}},
+                )
+                return self._tool_text_response(response, is_error=False)
+
+            headers, missing_env = self._normalize_headers(payload.get("headers"), payload.get("headers_env"))
+            if missing_env:
+                response.update(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "missing_env_headers",
+                            "message": "One or more headers_env variables are missing",
+                            "details": {"missing_env": missing_env},
+                        },
+                    }
+                )
+                return self._tool_text_response(response, is_error=True)
+
+            confirmed = _to_bool(payload.get("confirmed"), False)
+            if self.mcp_discovery_confirm_required and not confirmed:
+                response.update(
+                    {
+                        "ok": False,
+                        "confirmation_required": True,
+                        "message": (
+                            "Discovery/recommendation flow requires explicit confirmation before onboarding. "
+                            "Call mcp_stdio_bridge_start again with confirmed=true (or call mcp_server_onboard)."
+                        ),
+                        "proposed_server": {
+                            "name": name,
+                            "endpoint": str((bridge_result.get("bridge") or {}).get("endpoint") or ""),
+                            "description": str(payload.get("description") or f"{name} via stdio bridge"),
+                            "enabled": bool(payload.get("enabled", True)),
+                            "header_keys": sorted([str(key) for key in headers.keys()]),
+                        },
+                    }
+                )
+                return self._tool_text_response(response, is_error=False)
+
+            try:
+                onboard_result = self._perform_onboard(
+                    name=name,
+                    endpoint=str((bridge_result.get("bridge") or {}).get("endpoint") or ""),
+                    description=str(payload.get("description") or f"{name} via stdio bridge"),
+                    enabled=bool(payload.get("enabled", True)),
+                    headers=headers,
+                    disable_on_failed_test=_to_bool(payload.get("disable_on_failed_test"), False),
+                )
+                response["onboard_result"] = onboard_result
+                response["ok"] = bool(onboard_result.get("ok"))
+                response["next_step"] = (
+                    "Bridge started and onboarding passed."
+                    if bool(onboard_result.get("ok"))
+                    else "Bridge started but onboarding failed. Inspect test_result/tools_result."
+                )
+                self._emit_event(
+                    event_sink,
+                    {
+                        "event": "mcp_onboarding",
+                        "payload": {
+                            "action": "start_bridge_and_onboard",
+                            "name": name,
+                            "ok": bool(onboard_result.get("ok")),
+                        },
+                    },
+                )
+                return self._tool_text_response(response, is_error=not bool(response.get("ok")))
+            except RegistryError as exc:
+                response.update(
+                    {
+                        "ok": False,
+                        "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)},
+                    }
+                )
+                return self._tool_text_response(response, is_error=True)
+
+        return _mcp_stdio_bridge_start
+
+    def _build_mcp_stdio_bridge_status_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+            },
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_stdio_bridge_status",
+            "Report status for one bridge by name, or list all running/stopped bridge records.",
+            input_schema,
+        )
+        async def _mcp_stdio_bridge_status(args: Any) -> Dict[str, Any]:
+            payload = args if isinstance(args, dict) else {}
+            name = str(payload.get("name") or "").strip()
+            if name:
+                key = self._bridge_runtime_key(name)
+                row = self._bridge_processes.get(key) if isinstance(self._bridge_processes.get(key), dict) else None
+                if row is None:
+                    return self._tool_text_response(
+                        {
+                            "ok": False,
+                            "error": {"code": "not_found", "message": f"Bridge '{name}' was not found"},
+                        },
+                        is_error=True,
+                    )
+                response = {"ok": True, "bridge": self._serialize_bridge_record(row)}
+                self._emit_event(
+                    event_sink,
+                    {"event": "mcp_onboarding", "payload": {"action": "bridge_status", "name": name}},
+                )
+                return self._tool_text_response(response, is_error=False)
+
+            rows = [self._serialize_bridge_record(row) for row in self._bridge_processes.values() if isinstance(row, dict)]
+            response = {
+                "ok": True,
+                "bridge_count": len(rows),
+                "bridges": rows,
+            }
+            self._emit_event(
+                event_sink,
+                {"event": "mcp_onboarding", "payload": {"action": "bridge_status_all", "count": len(rows)}},
+            )
+            return self._tool_text_response(response, is_error=False)
+
+        return _mcp_stdio_bridge_status
+
+    def _build_mcp_stdio_bridge_stop_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "stop_all": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_stdio_bridge_stop",
+            "Stop one stdio bridge by name, or stop all bridges when stop_all=true.",
+            input_schema,
+        )
+        async def _mcp_stdio_bridge_stop(args: Any) -> Dict[str, Any]:
+            payload = args if isinstance(args, dict) else {}
+            stop_all = _to_bool(payload.get("stop_all"), False)
+            name = str(payload.get("name") or "").strip()
+
+            targets: List[Dict[str, Any]] = []
+            if stop_all:
+                targets = [row for row in self._bridge_processes.values() if isinstance(row, dict)]
+            else:
+                if not name:
+                    return self._tool_text_response(
+                        {
+                            "ok": False,
+                            "error": {"code": "validation_error", "message": "name or stop_all=true is required"},
+                        },
+                        is_error=True,
+                    )
+                key = self._bridge_runtime_key(name)
+                row = self._bridge_processes.get(key) if isinstance(self._bridge_processes.get(key), dict) else None
+                if row is None:
+                    return self._tool_text_response(
+                        {"ok": False, "error": {"code": "not_found", "message": f"Bridge '{name}' was not found"}},
+                        is_error=True,
+                    )
+                targets = [row]
+
+            stopped: List[Dict[str, Any]] = []
+            for row in list(targets):
+                stopped.append(self._stop_bridge_record(row))
+
+            response = {
+                "ok": True,
+                "stopped_count": len(stopped),
+                "stopped": stopped,
+            }
+            self._emit_event(
+                event_sink,
+                {"event": "mcp_onboarding", "payload": {"action": "bridge_stop", "count": len(stopped)}},
+            )
+            return self._tool_text_response(response, is_error=False)
+
+        return _mcp_stdio_bridge_stop
 
     def _build_mcp_server_upsert_tool(self, *, event_sink: Any | None = None) -> Any:
         input_schema = {

@@ -20,6 +20,9 @@ Use this workflow whenever the user asks to add or connect a new MCP server.
 - `mcp_tools_list_by_server`
 - `mcp_server_disable`
 - `mcp_stdio_bridge_plan`
+- `mcp_stdio_bridge_start`
+- `mcp_stdio_bridge_status`
+- `mcp_stdio_bridge_stop`
 
 ## Goals
 
@@ -49,8 +52,8 @@ If endpoint is missing or ambiguous, ask one short clarifying question.
    - Return top options with one recommendation, including `auth_requirement` and verification score/verdict.
    - Ask the user for explicit confirmation before any registry mutation.
 3. If recommended candidate is `stdio_bridge_required`:
-   - Call `mcp_stdio_bridge_plan` to produce exact bridge config/commands.
-   - Instruct operator to run bridge, then onboard local endpoint with `mcp_server_onboard`.
+   - Prefer `mcp_stdio_bridge_start` with `auto_onboard=true` and `confirmed=true`.
+   - If auto-start is unavailable, call `mcp_stdio_bridge_plan` for manual bridge config/commands, then onboard local endpoint.
 4. Primary onboarding (only after confirmation):
    - Call `mcp_server_onboard` with `confirmed=true` and normalized payload.
 5. If onboarding returns failure:

@@ -104,6 +104,9 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
         self.assertIn("mcp_server_onboard", names)
         self.assertIn("mcp_server_upsert", names)
         self.assertIn("mcp_stdio_bridge_plan", names)
+        self.assertIn("mcp_stdio_bridge_start", names)
+        self.assertIn("mcp_stdio_bridge_status", names)
+        self.assertIn("mcp_stdio_bridge_stop", names)
 
     def test_onboarding_tool_names_can_be_filtered(self) -> None:
         with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
