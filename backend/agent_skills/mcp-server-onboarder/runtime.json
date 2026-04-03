@@ -8,7 +8,8 @@
     "mcp_server_upsert",
     "mcp_server_test",
     "mcp_tools_list_by_server",
-    "mcp_server_disable"
+    "mcp_server_disable",
+    "mcp_stdio_bridge_plan"
   ],
   "trigger_keywords": [
     "add mcp server",

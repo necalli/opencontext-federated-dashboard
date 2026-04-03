@@ -89,6 +89,7 @@ MCP_ONBOARDING_TOOL_NAMES: Tuple[str, ...] = (
     "mcp_server_test",
     "mcp_tools_list_by_server",
     "mcp_server_disable",
+    "mcp_stdio_bridge_plan",
 )
 
 
@@ -765,6 +766,8 @@ class AnthropicAgentSDKRuntime:
             return self._build_mcp_tools_list_by_server_tool(event_sink=event_sink)
         if tool_name == "mcp_server_disable":
             return self._build_mcp_server_disable_tool(event_sink=event_sink)
+        if tool_name == "mcp_stdio_bridge_plan":
+            return self._build_mcp_stdio_bridge_plan_tool(event_sink=event_sink)
         if tool_name == "mcp_server_onboard":
             return self._build_mcp_server_onboard_tool(event_sink=event_sink)
         raise ValueError(f"Unsupported MCP onboarding tool: {tool_name}")
@@ -1066,6 +1069,13 @@ class AnthropicAgentSDKRuntime:
                 break
 
         auth_requirement, auth_evidence = self._infer_auth_requirement(text=f"{title} {description} {visible_text}")
+        transport_mode = self._infer_transport_mode(
+            item={"name": title, "description": description, "text": visible_text},
+            endpoint=endpoint,
+        )
+        stdio_launch = self._extract_stdio_launch_spec(
+            {"name": title, "description": description, "text": visible_text}
+        )
         vetting = self._build_vetting(
             endpoint=endpoint,
             homepage=homepage,
@@ -1081,6 +1091,8 @@ class AnthropicAgentSDKRuntime:
             "homepage": homepage,
             "tags": [],
             "updated_at": "",
+            "transport_mode": transport_mode,
+            "stdio_launch": stdio_launch,
             "auth_requirement": auth_requirement,
             "auth_evidence": auth_evidence,
             "verification": vetting,
@@ -1159,6 +1171,177 @@ class AnthropicAgentSDKRuntime:
         if blob_candidate:
             return blob_candidate
         return ""
+
+    @staticmethod
+    def _infer_transport_mode(*, item: Dict[str, Any], endpoint: str) -> str:
+        endpoint_value = str(endpoint or "").strip().lower()
+        if endpoint_value.startswith("http://") or endpoint_value.startswith("https://"):
+            return "remote_http"
+        blob = json.dumps(item, ensure_ascii=True, default=str).lower()
+        if "stdio" in blob:
+            return "stdio_only"
+        if "streamable-http" in blob or "\"sse\"" in blob or "server-sent" in blob:
+            return "remote_transport_unknown_endpoint"
+        return "unknown"
+
+    @staticmethod
+    def _guess_package_name(item: Dict[str, Any]) -> str:
+        candidates = [
+            item.get("package"),
+            item.get("packageName"),
+            item.get("npmPackage"),
+            item.get("npm_package"),
+            item.get("id"),
+            item.get("qualifiedName"),
+            item.get("name"),
+        ]
+        server_block = item.get("server")
+        if isinstance(server_block, dict):
+            candidates.extend(
+                [
+                    server_block.get("package"),
+                    server_block.get("packageName"),
+                    server_block.get("npmPackage"),
+                    server_block.get("id"),
+                    server_block.get("name"),
+                ]
+            )
+        for value in candidates:
+            token = str(value or "").strip()
+            if not token:
+                continue
+            if token.startswith("@") and "/" in token:
+                return token
+            if token.startswith("mcp-") or token.endswith("-mcp") or "mcp-server" in token:
+                return token
+        blob = json.dumps(item, ensure_ascii=True, default=str)
+        for token in re.findall(r"@[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+", blob):
+            return str(token or "").strip()
+        return ""
+
+    @staticmethod
+    def _extract_stdio_launch_spec(item: Dict[str, Any]) -> Dict[str, Any]:
+        command = ""
+        args: List[str] = []
+        env: Dict[str, str] = {}
+
+        direct_command = str(item.get("command") or "").strip()
+        if direct_command:
+            command = direct_command
+        direct_args = item.get("args")
+        if isinstance(direct_args, list):
+            args = [str(value or "").strip() for value in direct_args if str(value or "").strip()]
+        direct_env = item.get("env")
+        if isinstance(direct_env, dict):
+            env = {str(k): str(v) for k, v in direct_env.items() if str(k or "").strip()}
+
+        server_block = item.get("server")
+        if not command and isinstance(server_block, dict):
+            nested_command = str(server_block.get("command") or "").strip()
+            if nested_command:
+                command = nested_command
+            nested_args = server_block.get("args")
+            if isinstance(nested_args, list) and not args:
+                args = [str(value or "").strip() for value in nested_args if str(value or "").strip()]
+            nested_env = server_block.get("env")
+            if isinstance(nested_env, dict) and not env:
+                env = {str(k): str(v) for k, v in nested_env.items() if str(k or "").strip()}
+
+        package_name = AnthropicAgentSDKRuntime._guess_package_name(item)
+        if not command and package_name:
+            command = "npx"
+            args = ["-y", package_name]
+
+        return {
+            "command": command,
+            "args": args,
+            "env": env,
+            "package_name": package_name,
+            "ready": bool(command),
+        }
+
+    @staticmethod
+    def _slugify(value: str) -> str:
+        text = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+        return text or "mcp-server"
+
+    def _build_stdio_bridge_plan(
+        self,
+        *,
+        server_name: str,
+        command: str,
+        args: List[str],
+        env: Dict[str, str] | None = None,
+        bridge_host: str = "0.0.0.0",
+        bridge_port: int = 8300,
+        bridge_path: str = "/mcp",
+    ) -> Dict[str, Any]:
+        safe_name = str(server_name or "").strip() or "stdio-mcp"
+        slug = self._slugify(safe_name)
+        host = str(bridge_host or "").strip() or "0.0.0.0"
+        path = str(bridge_path or "").strip() or "/mcp"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        port = max(1, min(65535, int(bridge_port)))
+        cmd = str(command or "").strip()
+        args_list = [str(value or "").strip() for value in (args or []) if str(value or "").strip()]
+        env_map = env if isinstance(env, dict) else {}
+        config_payload = {
+            "server": {
+                "command": cmd,
+                "args": args_list,
+                "env": {str(k): str(v) for k, v in env_map.items() if str(k or "").strip()},
+            }
+        }
+        config_path = f"/content/{slug}-bridge.json"
+        run_cmd = (
+            "python -m mcp_http_bridge.main "
+            f"--config {config_path} --host {host} --port {port} --path {path}"
+        )
+        local_endpoint = f"http://127.0.0.1:{port}{path}"
+        return {
+            "mode": "stdio_bridge_required",
+            "bridge_type": "mcp-http-bridge",
+            "config_path_suggestion": config_path,
+            "config": config_payload,
+            "run_command": run_cmd,
+            "local_endpoint": local_endpoint,
+            "onboard_payload_template": {
+                "name": safe_name,
+                "endpoint": local_endpoint,
+                "description": f"{safe_name} via stdio->HTTP bridge",
+                "enabled": True,
+            },
+            "steps": [
+                "Install bridge dependency: python -m pip install mcp-http-bridge",
+                f"Write bridge config JSON to {config_path}",
+                f"Start bridge: {run_cmd}",
+                f"Call mcp_server_onboard with endpoint={local_endpoint}",
+            ],
+        }
+
+    def _bridge_plan_from_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        bridge_port: int = 8300,
+    ) -> Dict[str, Any]:
+        name = str(candidate.get("name") or "").strip() or "stdio-mcp"
+        launch = candidate.get("stdio_launch") if isinstance(candidate.get("stdio_launch"), dict) else {}
+        command = str(launch.get("command") or "").strip()
+        args = launch.get("args") if isinstance(launch.get("args"), list) else []
+        if not command:
+            package_name = str(launch.get("package_name") or "").strip() or self._guess_package_name(candidate)
+            if package_name:
+                command = "npx"
+                args = ["-y", package_name]
+        return self._build_stdio_bridge_plan(
+            server_name=name,
+            command=command,
+            args=[str(value or "").strip() for value in args if str(value or "").strip()],
+            env=launch.get("env") if isinstance(launch.get("env"), dict) else {},
+            bridge_port=bridge_port,
+        )
 
     @staticmethod
     def _extract_registry_server_name(item: Dict[str, Any]) -> str:
@@ -1242,6 +1425,8 @@ class AnthropicAgentSDKRuntime:
         mcp_url = self._extract_mcp_url(item)
         tags = self._extract_tags(item)
         updated_at = str(item.get("updatedAt") or item.get("updated_at") or item.get("lastUpdated") or "").strip()
+        transport_mode = self._infer_transport_mode(item=item, endpoint=mcp_url)
+        stdio_launch = self._extract_stdio_launch_spec(item)
         auth_requirement, auth_evidence = self._infer_auth_requirement(
             text=f"{name} {description} {' '.join(tags)} {homepage} {json.dumps(item, ensure_ascii=True, default=str)}"
         )
@@ -1259,6 +1444,8 @@ class AnthropicAgentSDKRuntime:
             "homepage": homepage,
             "tags": tags,
             "updated_at": updated_at,
+            "transport_mode": transport_mode,
+            "stdio_launch": stdio_launch,
             "auth_requirement": auth_requirement,
             "auth_evidence": auth_evidence,
             "verification": verification,
@@ -1505,6 +1692,26 @@ class AnthropicAgentSDKRuntime:
                 current["homepage"] = str(row.get("homepage") or "").strip()
             if not str(current.get("mcp_url") or "").strip():
                 current["mcp_url"] = str(row.get("mcp_url") or "").strip()
+            if not str(current.get("transport_mode") or "").strip():
+                current["transport_mode"] = str(row.get("transport_mode") or "").strip()
+            if not isinstance(current.get("stdio_launch"), dict):
+                current["stdio_launch"] = row.get("stdio_launch") if isinstance(row.get("stdio_launch"), dict) else {}
+            else:
+                existing_launch = current.get("stdio_launch") if isinstance(current.get("stdio_launch"), dict) else {}
+                incoming_launch = row.get("stdio_launch") if isinstance(row.get("stdio_launch"), dict) else {}
+                if incoming_launch:
+                    if not str(existing_launch.get("command") or "").strip():
+                        existing_launch["command"] = str(incoming_launch.get("command") or "").strip()
+                    existing_args = existing_launch.get("args") if isinstance(existing_launch.get("args"), list) else []
+                    incoming_args = incoming_launch.get("args") if isinstance(incoming_launch.get("args"), list) else []
+                    if not existing_args and incoming_args:
+                        existing_launch["args"] = [str(v or "").strip() for v in incoming_args if str(v or "").strip()]
+                    existing_package = str(existing_launch.get("package_name") or "").strip()
+                    incoming_package = str(incoming_launch.get("package_name") or "").strip()
+                    if not existing_package and incoming_package:
+                        existing_launch["package_name"] = incoming_package
+                    existing_launch["ready"] = bool(str(existing_launch.get("command") or "").strip())
+                    current["stdio_launch"] = existing_launch
             current_tags = current.get("tags") if isinstance(current.get("tags"), list) else []
             for tag in row.get("tags") if isinstance(row.get("tags"), list) else []:
                 if tag not in current_tags:
@@ -1624,8 +1831,13 @@ class AnthropicAgentSDKRuntime:
                 score += 20
                 reasons.append("endpoint_present")
             else:
-                score -= 20
-                reasons.append("endpoint_missing_or_non_http")
+                transport_mode = str(item.get("transport_mode") or "").strip()
+                if transport_mode == "stdio_only":
+                    score -= 6
+                    reasons.append("endpoint_missing_stdio_bridge_required")
+                else:
+                    score -= 20
+                    reasons.append("endpoint_missing_or_non_http")
 
             verification = item.get("verification") if isinstance(item.get("verification"), dict) else {}
             verification_score = int(verification.get("score") or 0)
@@ -1656,6 +1868,11 @@ class AnthropicAgentSDKRuntime:
             else:
                 score -= 4
                 reasons.append("auth:unknown")
+
+            transport_mode = str(item.get("transport_mode") or "").strip()
+            if transport_mode == "stdio_only":
+                score += 4
+                reasons.append("transport:stdio_supported_via_bridge")
 
             already_registered = False
             if name and name.casefold() in existing_by_name:
@@ -1839,6 +2056,17 @@ class AnthropicAgentSDKRuntime:
             include_existing = _to_bool(payload.get("include_existing_coverage"), True)
 
             discovered, source_reports = self._discover_server_candidates(query=query, limit=limit)
+            for item in discovered:
+                endpoint = str(item.get("mcp_url") or "").strip()
+                transport_mode = str(item.get("transport_mode") or "").strip()
+                if endpoint.startswith("http://") or endpoint.startswith("https://"):
+                    item["onboarding_mode"] = "direct_http"
+                elif transport_mode == "stdio_only":
+                    item["onboarding_mode"] = "stdio_bridge_required"
+                    item["bridge_plan"] = self._bridge_plan_from_candidate(candidate=item)
+                else:
+                    item["onboarding_mode"] = "unknown"
+
             existing_coverage = self._existing_coverage_candidates(query=query) if include_existing else []
             recommended_existing = existing_coverage[0] if existing_coverage else None
 
@@ -1852,16 +2080,40 @@ class AnthropicAgentSDKRuntime:
                 }
             elif discovered:
                 top = discovered[0]
-                recommendation = {
-                    "type": "onboard_candidate",
-                    "name": str(top.get("name") or "").strip(),
-                    "mcp_url": str(top.get("mcp_url") or "").strip(),
-                    "source": str(top.get("source") or "").strip(),
-                    "score": int(top.get("score") or 0),
-                    "auth_requirement": str(top.get("auth_requirement") or "unknown").strip() or "unknown",
-                    "verification": top.get("verification") if isinstance(top.get("verification"), dict) else {},
-                    "reason": "Top-ranked candidate by trust/relevance/operability.",
-                }
+                endpoint = str(top.get("mcp_url") or "").strip()
+                transport_mode = str(top.get("transport_mode") or "").strip()
+                if endpoint.startswith("http://") or endpoint.startswith("https://"):
+                    recommendation = {
+                        "type": "onboard_candidate",
+                        "name": str(top.get("name") or "").strip(),
+                        "mcp_url": endpoint,
+                        "source": str(top.get("source") or "").strip(),
+                        "score": int(top.get("score") or 0),
+                        "auth_requirement": str(top.get("auth_requirement") or "unknown").strip() or "unknown",
+                        "verification": top.get("verification") if isinstance(top.get("verification"), dict) else {},
+                        "reason": "Top-ranked candidate by trust/relevance/operability.",
+                    }
+                elif transport_mode == "stdio_only":
+                    recommendation = {
+                        "type": "bridge_then_onboard",
+                        "name": str(top.get("name") or "").strip(),
+                        "source": str(top.get("source") or "").strip(),
+                        "score": int(top.get("score") or 0),
+                        "auth_requirement": str(top.get("auth_requirement") or "unknown").strip() or "unknown",
+                        "verification": top.get("verification") if isinstance(top.get("verification"), dict) else {},
+                        "bridge_plan": self._bridge_plan_from_candidate(candidate=top),
+                        "reason": "Top candidate is stdio-only; bridge to HTTP first, then onboard endpoint.",
+                    }
+                else:
+                    recommendation = {
+                        "type": "candidate_needs_manual_endpoint",
+                        "name": str(top.get("name") or "").strip(),
+                        "source": str(top.get("source") or "").strip(),
+                        "score": int(top.get("score") or 0),
+                        "auth_requirement": str(top.get("auth_requirement") or "unknown").strip() or "unknown",
+                        "verification": top.get("verification") if isinstance(top.get("verification"), dict) else {},
+                        "reason": "Candidate found but no reliable remote endpoint was detected.",
+                    }
 
             response = {
                 "ok": True,
@@ -1872,7 +2124,8 @@ class AnthropicAgentSDKRuntime:
                 "recommendation": recommendation,
                 "source_reports": source_reports,
                 "next_step": (
-                    "Confirm the recommended option before calling mcp_server_onboard with confirmed=true."
+                    "Confirm the recommended option. For direct_http candidates call mcp_server_onboard with confirmed=true. "
+                    "For stdio_bridge_required candidates use mcp_stdio_bridge_plan (or provided bridge_plan), run the bridge, then onboard local endpoint."
                     if recommendation is not None
                     else "No strong candidates found. Refine query or provide an endpoint manually."
                 ),
@@ -1887,6 +2140,87 @@ class AnthropicAgentSDKRuntime:
             return self._tool_text_response(response, is_error=False)
 
         return _mcp_server_discover
+
+    def _build_mcp_stdio_bridge_plan_tool(self, *, event_sink: Any | None = None) -> Any:
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "command": {"type": "string"},
+                "args": {"type": "array", "items": {"type": "string"}},
+                "env": {"type": "object"},
+                "package_name": {"type": "string"},
+                "bridge_host": {"type": "string"},
+                "bridge_port": {"type": "integer"},
+                "bridge_path": {"type": "string"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        }
+
+        @sdk_tool(
+            "mcp_stdio_bridge_plan",
+            (
+                "Create a concrete stdio-to-HTTP bridge plan (config + commands + local endpoint) "
+                "for stdio-only MCP servers so they can be onboarded to the dashboard."
+            ),
+            input_schema,
+        )
+        async def _mcp_stdio_bridge_plan(args: Any) -> Dict[str, Any]:
+            payload = args if isinstance(args, dict) else {}
+            name = str(payload.get("name") or "").strip()
+            if not name:
+                return self._tool_text_response(
+                    {"ok": False, "error": {"code": "validation_error", "message": "name is required"}},
+                    is_error=True,
+                )
+
+            command = str(payload.get("command") or "").strip()
+            args_value = payload.get("args") if isinstance(payload.get("args"), list) else []
+            command_args = [str(value or "").strip() for value in args_value if str(value or "").strip()]
+            env_map = payload.get("env") if isinstance(payload.get("env"), dict) else {}
+            package_name = str(payload.get("package_name") or "").strip()
+            if not command and package_name:
+                command = "npx"
+                command_args = ["-y", package_name]
+
+            if not command:
+                return self._tool_text_response(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "missing_stdio_launch",
+                            "message": "Provide command/args or package_name to generate a bridge plan.",
+                        },
+                    },
+                    is_error=True,
+                )
+
+            bridge_plan = self._build_stdio_bridge_plan(
+                server_name=name,
+                command=command,
+                args=command_args,
+                env={str(k): str(v) for k, v in env_map.items() if str(k or "").strip()},
+                bridge_host=str(payload.get("bridge_host") or "").strip() or "0.0.0.0",
+                bridge_port=max(1, min(65535, _to_int(payload.get("bridge_port"), 8300))),
+                bridge_path=str(payload.get("bridge_path") or "").strip() or "/mcp",
+            )
+            response = {
+                "ok": True,
+                "server": {"name": name},
+                "bridge_plan": bridge_plan,
+                "next_step": (
+                    "Run bridge steps, then call mcp_server_onboard using "
+                    f"endpoint={bridge_plan.get('local_endpoint')}"
+                ),
+            }
+            self._emit_event(
+                event_sink,
+                {"event": "mcp_onboarding", "payload": {"action": "build_stdio_bridge_plan", "server_name": name}},
+            )
+            return self._tool_text_response(response, is_error=False)
+
+        return _mcp_stdio_bridge_plan
 
     def _build_mcp_server_upsert_tool(self, *, event_sink: Any | None = None) -> Any:
         input_schema = {

@@ -18,6 +18,7 @@ Use this priority order for MCP discovery:
 
 Rationale: community-governed and aligned with MCP ecosystem defaults.
 Important: many entries are `stdio` local-process transports; treat those as discovery-only unless you run a bridge.
+For stdio-only servers, generate a bridge plan with `mcp_stdio_bridge_plan` and onboard the resulting local HTTP endpoint.
 
 ## 2) MCP Market
 
