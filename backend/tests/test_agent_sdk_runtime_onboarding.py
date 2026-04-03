@@ -186,6 +186,37 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
         verification = normalized.get("verification") if isinstance(normalized.get("verification"), dict) else {}
         self.assertGreater(int(verification.get("score") or 0), 0)
 
+    def test_extract_mcp_url_supports_streamable_http_transport_shape(self) -> None:
+        with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
+            runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
+            endpoint = runtime._extract_mcp_url(
+                {
+                    "name": "example-server",
+                    "transports": [
+                        {"type": "stdio"},
+                        {"type": "streamable-http", "url": "https://example.com/mcp"},
+                    ],
+                }
+            )
+        self.assertEqual(endpoint, "https://example.com/mcp")
+
+    def test_extract_official_registry_records_handles_list_and_names(self) -> None:
+        with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
+            runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
+            records, names = runtime._extract_official_registry_records(
+                {
+                    "servers": [
+                        {"name": "alpha", "description": "A"},
+                        "beta",
+                        {"name": "gamma"},
+                    ]
+                }
+            )
+        self.assertEqual(len(records), 2)
+        self.assertIn("alpha", names)
+        self.assertIn("beta", names)
+        self.assertIn("gamma", names)
+
 
 if __name__ == "__main__":
     unittest.main()

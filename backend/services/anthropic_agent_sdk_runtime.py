@@ -1103,15 +1103,117 @@ class AnthropicAgentSDKRuntime:
             value = str(item.get(key) or "").strip()
             if value:
                 return value
+        server_block = item.get("server")
+        if isinstance(server_block, dict):
+            for key in ("mcpUrl", "mcp_url", "endpoint", "url"):
+                value = str(server_block.get(key) or "").strip()
+                if value:
+                    return value
+
+        def _walk_transport(value: Any) -> str:
+            if isinstance(value, dict):
+                kind = str(
+                    value.get("type")
+                    or value.get("transport")
+                    or value.get("protocol")
+                    or value.get("kind")
+                    or ""
+                ).strip().lower()
+                for key in ("url", "endpoint", "mcpUrl", "mcp_url"):
+                    candidate = str(value.get(key) or "").strip()
+                    if candidate.startswith("http://") or candidate.startswith("https://"):
+                        return candidate
+                if kind in {"streamable-http", "sse", "http", "https", "websocket"}:
+                    for key in ("value", "target"):
+                        candidate = str(value.get(key) or "").strip()
+                        if candidate.startswith("http://") or candidate.startswith("https://"):
+                            return candidate
+                for nested in value.values():
+                    candidate = _walk_transport(nested)
+                    if candidate:
+                        return candidate
+                return ""
+            if isinstance(value, list):
+                for entry in value:
+                    candidate = _walk_transport(entry)
+                    if candidate:
+                        return candidate
+            return ""
+
         transports = item.get("transports")
-        if isinstance(transports, dict):
-            http_transport = transports.get("http")
-            if isinstance(http_transport, dict):
-                for key in ("url", "endpoint", "mcpUrl"):
-                    value = str(http_transport.get(key) or "").strip()
-                    if value:
-                        return value
+        candidate = _walk_transport(transports)
+        if candidate:
+            return candidate
+        for key in ("transport", "remote", "remotes", "connections", "endpoints"):
+            candidate = _walk_transport(item.get(key))
+            if candidate:
+                return candidate
+        blob_candidate = ""
+        for candidate in AnthropicAgentSDKRuntime._extract_http_urls(json.dumps(item, ensure_ascii=True, default=str)):
+            lower = candidate.lower()
+            if "registry.modelcontextprotocol.io" in lower:
+                continue
+            if "/mcp" in lower or "/sse" in lower or "/api" in lower:
+                blob_candidate = candidate
+                break
+        if blob_candidate:
+            return blob_candidate
         return ""
+
+    @staticmethod
+    def _extract_official_registry_records(payload: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
+        records: List[Dict[str, Any]] = []
+        names: List[str] = []
+
+        def _consume_list(rows: Any) -> None:
+            if not isinstance(rows, list):
+                return
+            for row in rows:
+                if isinstance(row, dict):
+                    records.append(row)
+                    name = str(
+                        row.get("name")
+                        or row.get("server")
+                        or row.get("id")
+                        or row.get("qualifiedName")
+                        or ""
+                    ).strip()
+                    if name:
+                        names.append(name)
+                elif isinstance(row, str):
+                    value = str(row or "").strip()
+                    if value:
+                        names.append(value)
+
+        if isinstance(payload, list):
+            _consume_list(payload)
+            return records, names
+        if not isinstance(payload, dict):
+            return records, names
+
+        _consume_list(payload.get("servers"))
+        _consume_list(payload.get("items"))
+        _consume_list(payload.get("results"))
+        _consume_list(payload.get("data"))
+        data_block = payload.get("data")
+        if isinstance(data_block, dict):
+            _consume_list(data_block.get("servers"))
+            _consume_list(data_block.get("items"))
+            _consume_list(data_block.get("results"))
+
+        if isinstance(payload.get("name"), str):
+            records.append(payload)
+            names.append(str(payload.get("name") or "").strip())
+
+        deduped_names: List[str] = []
+        seen = set()
+        for name in names:
+            value = str(name or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            deduped_names.append(value)
+        return records, deduped_names
 
     def _normalize_discovery_item(
         self,
@@ -1149,24 +1251,106 @@ class AnthropicAgentSDKRuntime:
         }
 
     def _discover_from_official_registry(self, *, query: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        encoded = urllib.parse.quote_plus(query)
+        encoded = urllib.parse.quote_plus(str(query or "").strip())
+        fetch_limit = max(5, min(50, int(limit)))
+        base = "https://registry.modelcontextprotocol.io/v0.1/servers"
         urls = [
-            f"https://registry.modelcontextprotocol.io/v0/servers?query={encoded}&limit={limit}",
-            f"https://registry.modelcontextprotocol.io/v0/servers?q={encoded}&limit={limit}",
-            "https://registry.modelcontextprotocol.io/v0/servers",
+            f"{base}?q={encoded}&limit={fetch_limit}",
+            f"{base}?query={encoded}&limit={fetch_limit}",
+            f"{base}?search={encoded}&limit={fetch_limit}",
+            f"{base}?limit={fetch_limit}",
         ]
         last_error: Dict[str, Any] | None = None
+        list_payload: Any = None
+        list_url = ""
         for url in urls:
             try:
-                payload = self._http_json_get(url=url)
-                items = self._extract_items(payload)
-                normalized = [self._normalize_discovery_item(source="official_registry", item=item) for item in items]
-                if query.strip():
-                    normalized = self._filter_discovery_items_by_query(normalized, query=query)
-                return normalized[:limit], {"ok": True, "source": "official_registry", "url": url}
+                list_payload = self._http_json_get(url=url)
+                list_url = url
+                break
             except RegistryError as exc:
                 last_error = {"source": "official_registry", "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)}}
-        return [], {"ok": False, "source": "official_registry", "error": last_error or {"message": "unavailable"}}
+
+        if list_payload is None:
+            return [], {"ok": False, "source": "official_registry", "error": last_error or {"message": "unavailable"}}
+
+        records, names = self._extract_official_registry_records(list_payload)
+        normalized: List[Dict[str, Any]] = []
+        detail_reports: List[Dict[str, Any]] = []
+        names_limit = max(3, min(fetch_limit, int(limit)))
+
+        for record in records[: names_limit * 2]:
+            item = self._normalize_discovery_item(source="official_registry", item=record)
+            endpoint = str(item.get("mcp_url") or "").strip()
+            if endpoint.startswith("http://") or endpoint.startswith("https://"):
+                item["onboarding_readiness"] = "remote_endpoint_available"
+                normalized.append(item)
+
+        detail_names = names[:names_limit]
+        for name in detail_names:
+            quoted = urllib.parse.quote(str(name or "").strip(), safe="")
+            detail_urls = [
+                f"https://registry.modelcontextprotocol.io/v0.1/servers/{quoted}/versions/latest",
+                f"https://registry.modelcontextprotocol.io/v0.1/servers/{quoted}/versions",
+            ]
+            detail_payload: Any = None
+            detail_url = ""
+            for candidate_url in detail_urls:
+                try:
+                    detail_payload = self._http_json_get(url=candidate_url)
+                    detail_url = candidate_url
+                    break
+                except RegistryError as exc:
+                    detail_reports.append(
+                        {
+                            "ok": False,
+                            "source": "official_registry",
+                            "name": name,
+                            "url": candidate_url,
+                            "error": exc.to_dict() if hasattr(exc, "to_dict") else {"message": str(exc)},
+                        }
+                    )
+            if detail_payload is None:
+                continue
+
+            detail_records, _ = self._extract_official_registry_records(detail_payload)
+            if not detail_records and isinstance(detail_payload, dict):
+                detail_records = [detail_payload]
+            for record in detail_records:
+                row = dict(record)
+                if not str(row.get("name") or "").strip():
+                    row["name"] = name
+                item = self._normalize_discovery_item(source="official_registry", item=row)
+                endpoint = str(item.get("mcp_url") or "").strip()
+                if endpoint.startswith("http://") or endpoint.startswith("https://"):
+                    item["onboarding_readiness"] = "remote_endpoint_available"
+                    normalized.append(item)
+                else:
+                    item["onboarding_readiness"] = "stdio_or_non_remote_transport"
+                detail_reports.append(
+                    {
+                        "ok": True,
+                        "source": "official_registry",
+                        "name": name,
+                        "url": detail_url,
+                        "endpoint_found": bool(endpoint),
+                        "onboarding_readiness": str(item.get("onboarding_readiness") or ""),
+                    }
+                )
+
+        deduped = self._dedupe_discovery_candidates(normalized)
+        if query.strip():
+            deduped = self._filter_discovery_items_by_query(deduped, query=query)
+
+        return deduped[: max(1, int(limit))], {
+            "ok": bool(deduped),
+            "source": "official_registry",
+            "url": list_url,
+            "records_seen": len(records),
+            "names_seen": len(names),
+            "candidates_onboardable": len(deduped),
+            "detail_reports": detail_reports[: max(3, int(limit) * 3)],
+        }
 
     def _discover_from_mcpmarket(self, *, query: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         topic = str(query or "").strip()
