@@ -103,6 +103,7 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
         self.assertIn("mcp_server_discover", names)
         self.assertIn("mcp_server_onboard", names)
         self.assertIn("mcp_server_upsert", names)
+        self.assertIn("mcp_stdio_bridge_plan", names)
 
     def test_onboarding_tool_names_can_be_filtered(self) -> None:
         with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
@@ -199,6 +200,37 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
                 }
             )
         self.assertEqual(endpoint, "https://example.com/mcp")
+
+    def test_normalize_discovery_item_marks_stdio_only_when_no_http_endpoint(self) -> None:
+        with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
+            runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
+            normalized = runtime._normalize_discovery_item(
+                source="official_registry",
+                item={
+                    "name": "duckdb-mcp",
+                    "description": "DuckDB MCP server",
+                    "transports": [{"type": "stdio"}],
+                    "command": "npx",
+                    "args": ["-y", "@motherduck/mcp-server-duckdb"],
+                },
+            )
+        self.assertEqual(str(normalized.get("transport_mode") or ""), "stdio_only")
+        launch = normalized.get("stdio_launch") if isinstance(normalized.get("stdio_launch"), dict) else {}
+        self.assertEqual(str(launch.get("command") or ""), "npx")
+
+    def test_build_stdio_bridge_plan_creates_local_endpoint_and_onboard_template(self) -> None:
+        with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
+            runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
+            plan = runtime._build_stdio_bridge_plan(
+                server_name="duckdb-mcp",
+                command="npx",
+                args=["-y", "@motherduck/mcp-server-duckdb"],
+                bridge_port=8330,
+            )
+        self.assertEqual(str(plan.get("mode") or ""), "stdio_bridge_required")
+        self.assertEqual(str(plan.get("local_endpoint") or ""), "http://127.0.0.1:8330/mcp")
+        payload = plan.get("onboard_payload_template") if isinstance(plan.get("onboard_payload_template"), dict) else {}
+        self.assertEqual(str(payload.get("endpoint") or ""), "http://127.0.0.1:8330/mcp")
 
     def test_extract_official_registry_records_handles_list_and_names(self) -> None:
         with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
