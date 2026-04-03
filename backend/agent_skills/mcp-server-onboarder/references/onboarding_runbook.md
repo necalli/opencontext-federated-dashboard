@@ -18,6 +18,13 @@ This runbook defines pass/fail criteria for MCP server onboarding.
    - `mcp_server_test`
    - `mcp_server_disable`
 
+## Grounding Requirement
+
+1. Each onboarding cycle must start with a fresh `mcp_servers_list` call.
+2. Do not reuse previous cycle output for "add another server" requests.
+3. Do not assert missing tools unless a current-turn tool call returned an explicit error.
+4. If no onboarding tools were called in the turn, retry tool execution before producing a diagnostic summary.
+
 ## Success Criteria
 
 Onboarding is considered successful only if:
