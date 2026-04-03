@@ -9,7 +9,10 @@
     "mcp_server_test",
     "mcp_tools_list_by_server",
     "mcp_server_disable",
-    "mcp_stdio_bridge_plan"
+    "mcp_stdio_bridge_plan",
+    "mcp_stdio_bridge_start",
+    "mcp_stdio_bridge_status",
+    "mcp_stdio_bridge_stop"
   ],
   "trigger_keywords": [
     "add mcp server",
