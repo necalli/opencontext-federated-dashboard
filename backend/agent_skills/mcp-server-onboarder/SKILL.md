@@ -45,7 +45,7 @@ If endpoint is missing or ambiguous, ask one short clarifying question.
    - Call `mcp_servers_list` to understand current state and avoid duplicate naming.
 2. Discovery and recommendation:
    - Call `mcp_server_discover` with the user topic (for example `NYC public housing`).
-   - Return top options with one recommendation.
+   - Return top options with one recommendation, including `auth_requirement` and verification score/verdict.
    - Ask the user for explicit confirmation before any registry mutation.
 3. Primary onboarding (only after confirmation):
    - Call `mcp_server_onboard` with `confirmed=true` and normalized payload.
@@ -75,6 +75,7 @@ Use this output format:
 - `status`: `passed` or `failed`
 - `server`: `<name> (<id>)`
 - `endpoint`: `<normalized endpoint>`
+- `auth_requirement`: `<no_auth_required|auth_required|unknown>`
 - `test_stage`: `<complete|ping|initialize|tools/list|...>`
 - `tool_count`: `<n>`
 - `actions_taken`: `<created/updated/disabled>`

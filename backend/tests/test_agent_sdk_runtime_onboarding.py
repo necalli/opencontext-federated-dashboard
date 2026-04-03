@@ -149,11 +149,13 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
                 query="nyc public housing",
                 candidates=[
                     {
-                        "source": "mcp_so",
+                        "source": "mcpmarket",
                         "name": "NYC Housing MCP",
                         "description": "NYC housing datasets",
                         "mcp_url": "https://community.example.dev/mcp",
                         "tags": ["nyc", "housing"],
+                        "auth_requirement": "unknown",
+                        "verification": {"score": 55},
                     },
                     {
                         "source": "official_registry",
@@ -161,10 +163,28 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
                         "description": "NYC housing datasets",
                         "mcp_url": "https://official.example.dev/mcp",
                         "tags": ["nyc", "housing"],
+                        "auth_requirement": "unknown",
+                        "verification": {"score": 55},
                     },
                 ],
             )
         self.assertEqual(str(scored[0].get("source") or ""), "official_registry")
+
+    def test_auth_inference_and_vetting_fields_present(self) -> None:
+        with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
+            runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
+            normalized = runtime._normalize_discovery_item(
+                source="official_registry",
+                item={
+                    "name": "Context7",
+                    "description": "Public docs MCP server. No API key required.",
+                    "endpoint": "https://mcp.context7.com/mcp",
+                    "homepage": "https://github.com/upstash/context7",
+                },
+            )
+        self.assertEqual(str(normalized.get("auth_requirement") or ""), "no_auth_required")
+        verification = normalized.get("verification") if isinstance(normalized.get("verification"), dict) else {}
+        self.assertGreater(int(verification.get("score") or 0), 0)
 
 
 if __name__ == "__main__":
