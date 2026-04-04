@@ -220,6 +220,34 @@ class SkillPackageRegistry:
                 loaded.append(skill)
         self.packages = tuple(loaded)
 
+    @staticmethod
+    def _is_mcp_onboarding_intent(text: str) -> bool:
+        value = _normalize_text(text).lower()
+        if not value:
+            return False
+
+        # Covers prompts like "add @org/server-mcp" even if "mcp server" is not explicit.
+        has_package_ref = bool(re.search(r"@[a-z0-9][\w.-]*/[\w.-]+", value))
+        has_mcp_signal = "mcp" in value or has_package_ref
+
+        action_tokens = (
+            "add",
+            "onboard",
+            "register",
+            "connect",
+            "integrate",
+            "enable",
+            "disable",
+            "remove",
+            "delete",
+            "test",
+            "verify",
+            "discover",
+            "recommend",
+        )
+        has_action = any(token in value for token in action_tokens)
+        return bool(has_mcp_signal and has_action)
+
     def resolve_for_message(self, message: str, *, max_skills: int = 3) -> Dict[str, Any]:
         text = _normalize_text(message).lower()
         if not text:
@@ -245,12 +273,16 @@ class SkillPackageRegistry:
 
         always_on = [item for item in active if item.always_on]
         scored: List[Tuple[int, SkillPackage]] = []
+        onboarding_intent = self._is_mcp_onboarding_intent(text)
         for package in active:
             score = 0
             for keyword in package.trigger_keywords:
                 key = str(keyword or "").strip().lower()
                 if key and key in text:
                     score += 1
+            if onboarding_intent and package.skill_id == "mcp-server-onboarder":
+                # Force onboarding skill into top-N selection for add/register/discover MCP requests.
+                score += 1000
             if score > 0:
                 scored.append((score, package))
 

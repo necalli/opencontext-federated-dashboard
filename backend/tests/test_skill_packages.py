@@ -48,6 +48,19 @@ class SkillPackageTests(unittest.TestCase):
         self.assertIn("mcp_server_onboard", context["allowed_tool_patterns"])
         self.assertIn("mcp_server_discover", context["allowed_tool_patterns"])
 
+    def test_resolve_mcp_onboarder_for_package_style_prompt(self) -> None:
+        context = self.registry.resolve_for_message("add @matchuplabs/nyc-api-mcp")
+        self.assertIn("mcp-server-onboarder", context["selected_skill_ids"])
+        self.assertIn("mcp_servers_list", context["allowed_tool_patterns"])
+
+    def test_resolve_mcp_onboarder_for_recommendation_prompt(self) -> None:
+        context = self.registry.resolve_for_message(
+            "I want to add a new mcp server that is data or finance related. "
+            "What interesting ones are available that you recommend?"
+        )
+        self.assertIn("mcp-server-onboarder", context["selected_skill_ids"])
+        self.assertIn("mcp_server_discover", context["allowed_tool_patterns"])
+
 
 if __name__ == "__main__":
     unittest.main()
