@@ -5,7 +5,7 @@ This runbook defines pass/fail criteria for MCP server onboarding.
 ## Standard Sequence
 
 1. `mcp_servers_list`
-2. `mcp_server_discover`
+2. `mcp_server_discover` using short intent phrases (1-3 words each), one query per call
 3. User confirmation on selected option
 4. If recommendation indicates `stdio_bridge_required`:
    - Prefer `mcp_stdio_bridge_start` (`auto_onboard=true`, `confirmed=true`)
@@ -24,6 +24,8 @@ This runbook defines pass/fail criteria for MCP server onboarding.
 2. Do not reuse previous cycle output for "add another server" requests.
 3. Do not assert missing tools unless a current-turn tool call returned an explicit error.
 4. If no onboarding tools were called in the turn, retry tool execution before producing a diagnostic summary.
+5. Discovery queries should be short and direct (for example `finance`, `stock market`, `nyc housing`), not sentence-length prompts.
+6. Include `queries_used` in operator output for discovery turns.
 
 ## Success Criteria
 

@@ -60,7 +60,12 @@ If endpoint is missing or ambiguous, ask one short clarifying question.
 1. Baseline inventory:
    - Call `mcp_servers_list` to understand current state and avoid duplicate naming.
 2. Discovery and recommendation:
-   - Call `mcp_server_discover` with the user topic (for example `NYC public housing`).
+   - Convert user intent into short search phrases before discovery calls.
+   - Call `mcp_server_discover` with one short phrase at a time (1-3 words per query).
+   - Prefer direct canonical phrases such as `finance`, `stock market`, `crypto`, `housing`, `NYC housing`.
+   - Avoid long sentence-style queries or multi-clause strings.
+   - If the first query returns no candidates, retry with 1-2 alternate short phrases derived from the same intent.
+   - Keep a `queries_used` list for transparency.
    - Return top options with one recommendation, including `auth_requirement` and verification score/verdict.
    - Ask the user for explicit confirmation before any registry mutation.
 3. If recommended candidate is `stdio_bridge_required`:
@@ -108,6 +113,7 @@ Use this output format:
 - `actions_taken`: `<created/updated/disabled>`
 - `next_step`: `<operator action>`
 - `grounding`: `<tools_executed + current-turn evidence>`
+- `queries_used`: `<ordered discovery queries actually executed>`
 
 If failed, include `error.code`, `error.message`, and one remediation bullet.
 
