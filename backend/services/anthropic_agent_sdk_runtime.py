@@ -281,9 +281,14 @@ class AnthropicAgentSDKRuntime:
                 internal_to_allowed["create_visualization"].append(viz_allowed_name)
 
         for onboarding_tool_name in onboarding_tool_names:
+            onboarding_tool = self._build_mcp_onboarding_tool(
+                tool_name=onboarding_tool_name,
+                event_sink=event_sink,
+            )
             wrapped_tools.append(
-                self._build_mcp_onboarding_tool(
-                    tool_name=onboarding_tool_name,
+                self._instrument_onboarding_tool(
+                    tool=onboarding_tool,
+                    tool_events=tool_events,
                     event_sink=event_sink,
                 )
             )
@@ -788,6 +793,115 @@ class AnthropicAgentSDKRuntime:
         if tool_name == "mcp_server_onboard":
             return self._build_mcp_server_onboard_tool(event_sink=event_sink)
         raise ValueError(f"Unsupported MCP onboarding tool: {tool_name}")
+
+    def _instrument_onboarding_tool(
+        self,
+        *,
+        tool: Any,
+        tool_events: List[Dict[str, Any]],
+        event_sink: Any | None = None,
+    ) -> Any:
+        tool_name = str(getattr(tool, "name", "") or "").strip()
+        description = str(getattr(tool, "description", "") or "").strip() or f"Execute {tool_name}"
+        input_schema = getattr(tool, "input_schema", None) if isinstance(getattr(tool, "input_schema", None), dict) else {}
+        if not input_schema:
+            input_schema = {"type": "object", "properties": {}}
+        handler = getattr(tool, "handler", None)
+        if not callable(handler) or not tool_name:
+            return tool
+
+        @sdk_tool(tool_name, description, input_schema)
+        async def _wrapped(args: Any) -> Dict[str, Any]:
+            tool_input = args if isinstance(args, dict) else {}
+            tool_use_id = f"sdktool_{uuid.uuid4().hex[:12]}"
+            tool_events.append(
+                {
+                    "type": "mcp_tool_use",
+                    "tool_name": tool_name,
+                    "server_name": "",
+                    "tool_use_id": tool_use_id,
+                    "input": dict(tool_input),
+                }
+            )
+            self._emit_event(
+                event_sink,
+                {
+                    "event": "tool_progress",
+                    "payload": {
+                        "phase": "tool_use",
+                        "tool_name": tool_name,
+                        "server_name": "",
+                        "tool_use_id": tool_use_id,
+                    },
+                },
+            )
+
+            try:
+                result = handler(args)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as exc:
+                error_text = f"Onboarding tool '{tool_name}' failed: {exc}"
+                tool_events.append(
+                    {
+                        "type": "mcp_tool_result",
+                        "tool_name": tool_name,
+                        "tool_use_id": tool_use_id,
+                        "is_error": True,
+                        "text_preview": error_text[:220],
+                    }
+                )
+                self._emit_event(
+                    event_sink,
+                    {
+                        "event": "tool_progress",
+                        "payload": {
+                            "phase": "tool_result",
+                            "tool_name": tool_name,
+                            "tool_use_id": tool_use_id,
+                            "is_error": True,
+                            "text_preview": error_text[:220],
+                        },
+                    },
+                )
+                raise
+
+            text_preview = ""
+            is_error = False
+            if isinstance(result, dict):
+                is_error = bool(result.get("is_error"))
+                content = result.get("content")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and str(item.get("type") or "").strip() == "text":
+                            text_preview = str(item.get("text") or "").strip()
+                            break
+
+            tool_events.append(
+                {
+                    "type": "mcp_tool_result",
+                    "tool_name": tool_name,
+                    "tool_use_id": tool_use_id,
+                    "is_error": is_error,
+                    "text_preview": text_preview[:220],
+                }
+            )
+            self._emit_event(
+                event_sink,
+                {
+                    "event": "tool_progress",
+                    "payload": {
+                        "phase": "tool_result",
+                        "tool_name": tool_name,
+                        "tool_use_id": tool_use_id,
+                        "is_error": is_error,
+                        "text_preview": text_preview[:220],
+                    },
+                },
+            )
+            return result
+
+        return _wrapped
 
     def _registry_service(self) -> ServerRegistryService:
         if self.server_registry is None:

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import unittest
 from unittest.mock import patch
@@ -269,6 +270,24 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
             )
         self.assertEqual(len(records), 1)
         self.assertEqual(names, ["@acme/example-mcp"])
+
+    def test_instrumented_onboarding_tool_emits_tool_events(self) -> None:
+        with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
+            runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
+            tool_events = []
+            raw_tool = runtime._build_mcp_servers_list_tool()
+            instrumented = runtime._instrument_onboarding_tool(
+                tool=raw_tool,
+                tool_events=tool_events,
+                event_sink=None,
+            )
+            result = asyncio.run(instrumented.handler({"enabled_only": False}))
+        self.assertIsInstance(result, dict)
+        self.assertEqual(len(tool_events), 2)
+        self.assertEqual(str(tool_events[0].get("type") or ""), "mcp_tool_use")
+        self.assertEqual(str(tool_events[0].get("tool_name") or ""), "mcp_servers_list")
+        self.assertEqual(str(tool_events[1].get("type") or ""), "mcp_tool_result")
+        self.assertEqual(str(tool_events[1].get("tool_name") or ""), "mcp_servers_list")
 
 
 if __name__ == "__main__":
