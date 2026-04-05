@@ -2238,9 +2238,6 @@ class AnthropicAgentSDKRuntime:
         official_rows, official_report = self._discover_from_official_registry(query=query, limit=limit * 3)
         rows.extend(official_rows)
         source_reports.append(official_report)
-        mcpmarket_rows, mcpmarket_report = self._discover_from_mcpmarket(query=query, limit=limit * 3)
-        rows.extend(mcpmarket_rows)
-        source_reports.append(mcpmarket_report)
         rows = self._dedupe_discovery_candidates(rows)
         ranked = self._score_discovery_candidates(query=query, candidates=rows)
         return ranked[: max(1, int(limit))], source_reports
@@ -2354,7 +2351,7 @@ class AnthropicAgentSDKRuntime:
         @sdk_tool(
             "mcp_server_discover",
             (
-                "Discover candidate MCP servers using Official MCP Registry and MCP Market discovery pages, "
+                "Discover candidate MCP servers using the Official MCP Registry REST API, "
                 "rank by relevance/trust/operability, and include authenticity + auth requirement vetting."
             ),
             input_schema,
