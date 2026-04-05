@@ -5,6 +5,7 @@ from services.agent_orchestrator import AgentOrchestrator
 from services.agent_runtime import AgentRuntime
 from services.anthropic_agent_sdk_runtime import AgentSDKRuntimeError
 from services.anthropic_mcp_connector import AnthropicConnectorError
+from services.skill_packages import SkillPackage
 
 
 class FakeAgentSDKRuntime:
@@ -13,6 +14,7 @@ class FakeAgentSDKRuntime:
         self.calls = 0
         self.last_system_prompt = ""
         self.last_session_id = ""
+        self.last_skill_context: Dict[str, Any] = {}
 
     def generate(
         self,
@@ -28,6 +30,7 @@ class FakeAgentSDKRuntime:
         self.calls += 1
         self.last_system_prompt = system_prompt
         self.last_session_id = session_id
+        self.last_skill_context = dict(skill_context or {})
         if self.should_fail:
             raise AgentSDKRuntimeError(
                 "agent_sdk_unavailable",
@@ -125,6 +128,28 @@ class StubRegistry:
 
     def list_servers(self) -> List[Dict[str, Any]]:
         return list(self._servers)
+
+
+class StubSkillRegistry:
+    def __init__(self, contexts: List[Dict[str, Any]], packages: List[SkillPackage] | None = None) -> None:
+        self._contexts = list(contexts)
+        self.packages = tuple(packages or [])
+        self.calls = 0
+
+    def refresh(self) -> None:
+        return None
+
+    def resolve_for_message(self, message: str, *, max_skills: int = 3) -> Dict[str, Any]:
+        index = min(self.calls, max(0, len(self._contexts) - 1))
+        self.calls += 1
+        return dict(self._contexts[index]) if self._contexts else {
+            "selected_skill_ids": [],
+            "selected_skill_titles": [],
+            "selected_skills": [],
+            "allowed_tool_patterns": [],
+            "allowed_tool_names": [],
+            "system_prompt_addendum": "",
+        }
 
 
 class AgentRuntimeTests(unittest.TestCase):
@@ -282,6 +307,145 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(result["meta"]["history_size"], 2)
         self.assertIn("skills", result["meta"]["debug"])
         self.assertIsInstance(result["meta"]["debug"]["skills"].get("selected_skill_ids"), list)
+
+    def test_onboarding_scope_sticky_keeps_tools_for_followup_turn(self) -> None:
+        registry = StubRegistry(self.servers)
+        orchestrator = AgentOrchestrator(registry=registry)
+        orchestrator.onboarding_scope_sticky_turns = 2
+        onboarding_package = SkillPackage(
+            skill_id="mcp-server-onboarder",
+            title="mcp-server-onboarder",
+            description="Onboarding workflow",
+            instruction="Use onboarding tools",
+            trigger_keywords=("onboard",),
+            allowed_tool_patterns=("mcp_server_discover", "mcp_server_onboard", "mcp_servers_list"),
+            always_on=False,
+            enabled=True,
+            path="/tmp/skill.md",
+        )
+        orchestrator.skill_registry = StubSkillRegistry(
+            contexts=[
+                {
+                    "selected_skill_ids": ["mcp-server-onboarder"],
+                    "selected_skill_titles": ["mcp-server-onboarder"],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": ["mcp_server_discover"],
+                    "allowed_tool_names": ["mcp_server_discover"],
+                    "system_prompt_addendum": "",
+                },
+                {
+                    "selected_skill_ids": [],
+                    "selected_skill_titles": [],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": [],
+                    "allowed_tool_names": [],
+                    "system_prompt_addendum": "",
+                },
+            ],
+            packages=[onboarding_package],
+        )
+        sdk = FakeAgentSDKRuntime(should_fail=False)
+        connector = FakeConnectorRuntime(should_fail=False)
+        deterministic = FakeDeterministicRuntime()
+        orchestrator.runtime = AgentRuntime(
+            agent_sdk_runtime=sdk,
+            connector_runtime=connector,
+            deterministic_runtime=deterministic,
+        )
+
+        orchestrator.run_turn(
+            message="add mcp server",
+            session_id="sticky-1",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+        second = orchestrator.run_turn(
+            message="try another term",
+            session_id="sticky-1",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+
+        selected_ids = second["meta"]["debug"]["skills"]["selected_skill_ids"]
+        allowed = second["meta"]["debug"]["skills"]["allowed_tool_patterns"]
+        self.assertIn("mcp-server-onboarder", selected_ids)
+        self.assertIn("mcp_server_discover", allowed)
+        self.assertIn("mcp_server_onboard", allowed)
+
+    def test_onboarding_scope_sticky_can_be_canceled(self) -> None:
+        registry = StubRegistry(self.servers)
+        orchestrator = AgentOrchestrator(registry=registry)
+        orchestrator.onboarding_scope_sticky_turns = 3
+        onboarding_package = SkillPackage(
+            skill_id="mcp-server-onboarder",
+            title="mcp-server-onboarder",
+            description="Onboarding workflow",
+            instruction="Use onboarding tools",
+            trigger_keywords=("onboard",),
+            allowed_tool_patterns=("mcp_server_discover", "mcp_server_onboard", "mcp_servers_list"),
+            always_on=False,
+            enabled=True,
+            path="/tmp/skill.md",
+        )
+        orchestrator.skill_registry = StubSkillRegistry(
+            contexts=[
+                {
+                    "selected_skill_ids": ["mcp-server-onboarder"],
+                    "selected_skill_titles": ["mcp-server-onboarder"],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": ["mcp_server_discover"],
+                    "allowed_tool_names": ["mcp_server_discover"],
+                    "system_prompt_addendum": "",
+                },
+                {
+                    "selected_skill_ids": [],
+                    "selected_skill_titles": [],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": [],
+                    "allowed_tool_names": [],
+                    "system_prompt_addendum": "",
+                },
+                {
+                    "selected_skill_ids": [],
+                    "selected_skill_titles": [],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": [],
+                    "allowed_tool_names": [],
+                    "system_prompt_addendum": "",
+                },
+            ],
+            packages=[onboarding_package],
+        )
+        sdk = FakeAgentSDKRuntime(should_fail=False)
+        connector = FakeConnectorRuntime(should_fail=False)
+        deterministic = FakeDeterministicRuntime()
+        orchestrator.runtime = AgentRuntime(
+            agent_sdk_runtime=sdk,
+            connector_runtime=connector,
+            deterministic_runtime=deterministic,
+        )
+
+        orchestrator.run_turn(
+            message="add mcp server",
+            session_id="sticky-2",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+        cancel = orchestrator.run_turn(
+            message="stop onboarding",
+            session_id="sticky-2",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+        after = orchestrator.run_turn(
+            message="run normal query",
+            session_id="sticky-2",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+
+        self.assertNotIn("mcp-server-onboarder", cancel["meta"]["debug"]["skills"]["selected_skill_ids"])
+        self.assertNotIn("mcp_server_discover", after["meta"]["debug"]["skills"]["allowed_tool_patterns"])
 
 
 if __name__ == "__main__":
