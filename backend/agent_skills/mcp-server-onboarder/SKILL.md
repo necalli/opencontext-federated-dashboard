@@ -3,7 +3,9 @@ name: mcp-server-onboarder
 description: >
   Onboard, validate, and operationalize new MCP servers in the dashboard control plane.
   Use for requests to add/register/connect a new MCP server, verify connectivity, confirm tools,
-  and update server availability safely.
+  and update server availability safely. Discovery query policy is strict: convert user intent into
+  1-3 word MCP registry queries (never sentence-length), run one query per call, and report
+  queries_used exactly as executed.
 ---
 
 # MCP Server Onboarder
@@ -36,6 +38,16 @@ This includes follow-up requests in the same chat session (for example: "add ano
    - a required tool call fails and you include the exact failure.
 6. If a response was generated without onboarding tool calls, do not continue onboarding logic. Retry with explicit tool calls first.
 
+## Discovery Query Discipline (Mandatory)
+
+1. `mcp_server_discover` queries MUST be short phrases of 1-3 words.
+2. NEVER pass a sentence, clause, or multi-comma phrase as a discovery query.
+3. Before every discovery call, rewrite user intent into a compact keyword phrase.
+4. Start with 2-4 canonical variants only (for example: `finance`, `stock market`, `crypto`).
+5. If a candidate query has more than 3 words, rewrite it before calling the tool.
+6. If no candidates are returned, iterate with alternate short phrases from the same intent.
+7. Always include `queries_used` in final output, in exact execution order.
+
 ## Goals
 
 1. Add or update server registration in dashboard registry.
@@ -64,7 +76,7 @@ If endpoint is missing or ambiguous, ask one short clarifying question.
    - Call `mcp_server_discover` with one short phrase at a time (1-3 words per query).
    - Prefer direct canonical phrases such as `finance`, `stock market`, `crypto`, `housing`, `NYC housing`.
    - Avoid long sentence-style queries or multi-clause strings.
-   - If the first query returns no candidates, retry with 1-2 alternate short phrases derived from the same intent.
+   - If the first query returns no candidates, retry with 1-3 alternate short phrases derived from the same intent.
    - Keep a `queries_used` list for transparency.
    - Return top options with one recommendation, including `auth_requirement` and verification score/verdict.
    - Ask the user for explicit confirmation before any registry mutation.

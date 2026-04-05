@@ -26,6 +26,8 @@ This runbook defines pass/fail criteria for MCP server onboarding.
 4. If no onboarding tools were called in the turn, retry tool execution before producing a diagnostic summary.
 5. Discovery queries should be short and direct (for example `finance`, `stock market`, `nyc housing`), not sentence-length prompts.
 6. Include `queries_used` in operator output for discovery turns.
+7. If any planned query is longer than 3 words, rewrite it before calling `mcp_server_discover`.
+8. Do not batch multiple phrases into one query string.
 
 ## Success Criteria
 

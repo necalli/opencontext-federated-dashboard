@@ -35,6 +35,8 @@ class AgentOrchestrator:
                     "for Boston/CKAN requests, prefer ckan__* tools from opencontext-main. "
                     "Use generic get_data only when alias-specific tools are unavailable. "
                     "When user asks to add/connect/onboard an MCP server, execute the MCP onboarding flow: "
+                    "convert discovery intent into short search phrases (1-3 words) and call mcp_server_discover one phrase per call; "
+                    "never use sentence-length discovery queries; "
                     "first discover candidates and recommend options, then wait for explicit user confirmation, "
                     "if candidate onboarding_mode is stdio_bridge_required, prefer mcp_stdio_bridge_start "
                     "(auto_onboard=true, confirmed=true) to start bridge and onboard automatically; "
