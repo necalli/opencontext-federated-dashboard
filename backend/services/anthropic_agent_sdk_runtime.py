@@ -259,6 +259,7 @@ class AnthropicAgentSDKRuntime:
             )
 
         tool_events: List[Dict[str, Any]] = []
+        builtin_tool_events: List[Dict[str, Any]] = []
         visualization_artifacts: List[Dict[str, Any]] = []
         wrapped_tools, allowed_tool_names, internal_to_allowed = self._build_wrapped_tools(
             available_tools=available_tools,
@@ -398,6 +399,7 @@ class AnthropicAgentSDKRuntime:
             message=effective_message,
             app_session_id=app_session_id,
             prior_sdk_session=prior_sdk_session,
+            builtin_tool_events=builtin_tool_events,
             event_sink=event_sink,
         )
         sdk_meta = run_result.get("sdk_meta") if isinstance(run_result.get("sdk_meta"), dict) else {}
@@ -417,6 +419,7 @@ class AnthropicAgentSDKRuntime:
             "usage": run_result.get("usage", {}),
             "server_names": [str(row.get("name") or "").strip() for row in active_servers],
             "tool_events": tool_events,
+            "builtin_tool_events": builtin_tool_events,
             "visualizations": visualization_artifacts,
             "sdk_meta": sdk_meta,
         }
@@ -3706,6 +3709,7 @@ class AnthropicAgentSDKRuntime:
         message: str,
         app_session_id: str,
         prior_sdk_session: str,
+        builtin_tool_events: List[Dict[str, Any]],
         event_sink: Any | None = None,
     ) -> Dict[str, Any]:
         try:
@@ -3715,6 +3719,7 @@ class AnthropicAgentSDKRuntime:
                     message=message,
                     app_session_id=app_session_id,
                     prior_sdk_session=prior_sdk_session,
+                    builtin_tool_events=builtin_tool_events,
                     event_sink=event_sink,
                 )
             )
@@ -3729,6 +3734,7 @@ class AnthropicAgentSDKRuntime:
                             message=message,
                             app_session_id=app_session_id,
                             prior_sdk_session=prior_sdk_session,
+                            builtin_tool_events=builtin_tool_events,
                             event_sink=event_sink,
                         )
                     )
@@ -3749,6 +3755,7 @@ class AnthropicAgentSDKRuntime:
         message: str,
         app_session_id: str,
         prior_sdk_session: str,
+        builtin_tool_events: List[Dict[str, Any]],
         event_sink: Any | None = None,
     ) -> Dict[str, Any]:
         if ClaudeSDKClient is None:
@@ -3763,6 +3770,15 @@ class AnthropicAgentSDKRuntime:
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt=message)
             async for event in client.receive_response():
+                for builtin_event in self._extract_builtin_tool_events(event):
+                    builtin_tool_events.append(builtin_event)
+                    self._emit_event(
+                        event_sink,
+                        {
+                            "event": "builtin_tool",
+                            "payload": builtin_event,
+                        },
+                    )
                 snapshot = self._extract_assistant_snapshot(event)
                 if snapshot:
                     snapshots.append(snapshot)
@@ -3812,6 +3828,61 @@ class AnthropicAgentSDKRuntime:
             "usage": usage,
             "sdk_meta": sdk_meta,
         }
+
+    def _extract_builtin_tool_events(self, event: Any) -> List[Dict[str, Any]]:
+        content = getattr(event, "content", None)
+        if not isinstance(content, list):
+            return []
+        output: List[Dict[str, Any]] = []
+        for block in content:
+            payload: Dict[str, Any] = {}
+            if isinstance(block, dict):
+                payload = dict(block)
+            else:
+                for field in ("type", "name", "id", "tool_use_id", "input", "is_error", "error"):
+                    if hasattr(block, field):
+                        payload[field] = getattr(block, field)
+            block_type = str(payload.get("type") or "").strip().lower()
+            if block_type not in {"tool_use", "tool_result"}:
+                continue
+
+            tool_name = str(payload.get("name") or "").strip()
+            if tool_name.startswith(f"mcp__{self.server_alias}__"):
+                continue
+
+            if block_type == "tool_use":
+                output.append(
+                    {
+                        "type": "builtin_tool_use",
+                        "tool_name": tool_name,
+                        "tool_use_id": str(payload.get("id") or "").strip(),
+                        "input": payload.get("input") if isinstance(payload.get("input"), dict) else {},
+                    }
+                )
+                continue
+
+            result_text = ""
+            content_rows = payload.get("content")
+            if isinstance(content_rows, list):
+                for row in content_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    if str(row.get("type") or "").strip() != "text":
+                        continue
+                    result_text = str(row.get("text") or "").strip()
+                    if result_text:
+                        break
+            output.append(
+                {
+                    "type": "builtin_tool_result",
+                    "tool_name": tool_name,
+                    "tool_use_id": str(payload.get("tool_use_id") or "").strip(),
+                    "is_error": bool(payload.get("is_error", False)),
+                    "text_preview": result_text[:220],
+                    "error": payload.get("error") if isinstance(payload.get("error"), dict) else {},
+                }
+            )
+        return output
 
     def _extract_assistant_snapshot(self, event: Any) -> str:
         if SdkAssistantMessage is not None and isinstance(event, SdkAssistantMessage):

@@ -3,9 +3,9 @@ name: mcp-server-onboarder
 description: >
   Onboard, validate, and operationalize new MCP servers in the dashboard control plane.
   Use for requests to add/register/connect a new MCP server, verify connectivity, confirm tools,
-  and update server availability safely. Discovery query policy is strict: convert user intent into
-  1-3 word MCP registry queries (never sentence-length), run one query per call, and report
-  queries_used exactly as executed.
+  and update server availability safely. Discovery query policy is strict: prefer single-word
+  MCP registry queries (two words only when necessary, never three or more), run one query per
+  call, and report queries_used exactly as executed.
 ---
 
 # MCP Server Onboarder
@@ -40,13 +40,26 @@ This includes follow-up requests in the same chat session (for example: "add ano
 
 ## Discovery Query Discipline (Mandatory)
 
-1. `mcp_server_discover` queries MUST be short phrases of 1-3 words.
+1. `mcp_server_discover` queries MUST be single words whenever possible.
 2. NEVER pass a sentence, clause, or multi-comma phrase as a discovery query.
-3. Before every discovery call, rewrite user intent into a compact keyword phrase.
-4. Start with 2-4 canonical variants only (for example: `finance`, `stock market`, `crypto`).
-5. If a candidate query has more than 3 words, rewrite it before calling the tool.
-6. If no candidates are returned, iterate with alternate short phrases from the same intent.
+3. Before every discovery call, distill user intent into the most precise single keyword.
+4. Prefer single-word queries. Two-word queries are acceptable only when a single word is too broad. Never use three or more words. The MCP registry tokenizes poorly on long composite phrases — one precise keyword outperforms a sentence every time. Good examples: `reddit`, `openFDA`, `census`, `weather`, `NASA`. Poor examples: `federal data sources`, `reddit posts and comments`, `social media data`.
+5. If a candidate query has more than 2 words, rewrite it before calling the tool.
+6. If a query returns 0 results, retry with 1-2 alternate single-word synonyms or related terms (e.g. if `census` returns 0, try `demographics`, then `population`). Do not expand query length — shorten or reword instead.
 7. Always include `queries_used` in final output, in exact execution order.
+
+## Auth Classification
+
+When evaluating and presenting candidates, classify auth using these tiers:
+
+- `no_auth` — no credentials needed; works immediately out of the box
+- `auth_optional` — server works without credentials; a key only improves rate limits or quota (e.g. a free API key that raises a daily request cap)
+- `auth_required` — server is non-functional without credentials
+
+If the user expresses an explicit auth preference (e.g. "no auth required"), treat it as a hard filter:
+- Exclude `auth_required` candidates from the primary recommendation.
+- List them separately under "excluded — requires auth" for transparency.
+- Surface `auth_optional` candidates with a clear note explaining what the optional key provides and that the server works without it.
 
 ## Goals
 
@@ -72,13 +85,14 @@ If endpoint is missing or ambiguous, ask one short clarifying question.
 1. Baseline inventory:
    - Call `mcp_servers_list` to understand current state and avoid duplicate naming.
 2. Discovery and recommendation:
-   - Convert user intent into short search phrases before discovery calls.
-   - Call `mcp_server_discover` with one short phrase at a time (1-3 words per query).
-   - Prefer direct canonical phrases such as `finance`, `stock market`, `crypto`, `housing`, `NYC housing`.
-   - Avoid long sentence-style queries or multi-clause strings.
-   - If the first query returns no candidates, retry with 1-3 alternate short phrases derived from the same intent.
+   - Distill user intent into the most precise single keyword before discovery calls.
+   - Call `mcp_server_discover` with one word at a time (two words only when unavoidable).
+   - Prefer direct canonical single-word terms such as `finance`, `crypto`, `housing`, `weather`.
+   - Never use long sentence-style queries or multi-clause strings.
+   - If the first query returns no candidates, retry with 1-2 alternate single-word synonyms.
    - Keep a `queries_used` list for transparency.
    - Return top options with one recommendation, including `auth_requirement` and verification score/verdict.
+   - Apply any user auth preference as a hard filter before selecting the recommendation.
    - Ask the user for explicit confirmation before any registry mutation.
 3. If recommended candidate is `stdio_bridge_required`:
    - Prefer `mcp_stdio_bridge_start` with `auto_onboard=true` and `confirmed=true`.
@@ -92,6 +106,22 @@ If endpoint is missing or ambiguous, ask one short clarifying question.
    - Call `mcp_tools_list_by_server` for the server and confirm non-zero tools.
 7. Report:
    - Provide a concise operator summary (status, server id/name, tool count, errors/remediation).
+
+## Bridge Port Management
+
+Stdio bridges each require a dedicated port. Port collisions produce silent false positives — the health check passes against the wrong server, and the wrong tools get reported. To prevent this:
+
+1. Before calling `mcp_stdio_bridge_start`, check whether port 8300 (default) is already occupied by an existing bridge in the current session.
+2. If any prior bridge in this session used port 8300, explicitly pass `bridge_port=8301` (or increment further for each additional server: 8302, 8303, etc.).
+3. Each logical server must run on its own dedicated port — never share ports between bridges.
+
+## Multi-Server Registry Integrity
+
+When onboarding multiple servers in the same session, guard against one server's record silently overwriting another's:
+
+1. After onboarding each server, call `mcp_servers_list` to confirm it appears as a separate named entry in the registry.
+2. If two servers resolve to the same endpoint or port due to a collision, treat onboarding as failed and retry on a new port before proceeding.
+3. Never allow a new server to silently overwrite an existing server's registry record — if names or endpoints overlap unexpectedly, surface the conflict and ask the user to confirm.
 
 ## Same-Session Multi-Server Rule
 
@@ -119,7 +149,7 @@ Use this output format:
 - `status`: `passed` or `failed`
 - `server`: `<name> (<id>)`
 - `endpoint`: `<normalized endpoint>`
-- `auth_requirement`: `<no_auth_required|auth_required|unknown>`
+- `auth_requirement`: `<no_auth|auth_optional|auth_required|unknown>`
 - `test_stage`: `<complete|ping|initialize|tools/list|...>`
 - `tool_count`: `<n>`
 - `actions_taken`: `<created/updated/disabled>`

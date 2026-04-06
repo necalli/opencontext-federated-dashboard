@@ -107,6 +107,21 @@ class DeterministicMCPRuntime:
 
 
 class AgentRuntime:
+    ONBOARDING_SKILL_ID = "mcp-server-onboarder"
+    ONBOARDING_CONTROL_TOOLS = {
+        "mcp_server_discover",
+        "mcp_server_onboard",
+        "mcp_servers_list",
+        "mcp_server_upsert",
+        "mcp_server_test",
+        "mcp_tools_list_by_server",
+        "mcp_server_disable",
+        "mcp_stdio_bridge_plan",
+        "mcp_stdio_bridge_start",
+        "mcp_stdio_bridge_status",
+        "mcp_stdio_bridge_stop",
+    }
+
     def __init__(
         self,
         agent_sdk_runtime: AnthropicAgentSDKRuntime,
@@ -117,6 +132,9 @@ class AgentRuntime:
         self.connector_runtime = connector_runtime
         self.deterministic_runtime = deterministic_runtime
         self.primary_runtime = str(os.getenv("AGENT_RUNTIME_PRIMARY", "agent_sdk")).strip().lower()
+        self.onboarding_grounding_enforced = str(
+            os.getenv("AGENT_ONBOARDING_GROUNDING_ENFORCED", "true")
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
 
     @staticmethod
     def _resolve_runtime_order(
@@ -183,6 +201,139 @@ class AgentRuntime:
             "dashboard",
         )
         return any(token in text for token in keywords)
+
+    @classmethod
+    def _is_onboarding_scope(cls, selected_skill_ids: List[str]) -> bool:
+        values = [str(item or "").strip() for item in selected_skill_ids]
+        return cls.ONBOARDING_SKILL_ID in values
+
+    @staticmethod
+    def _is_analysis_or_data_prompt(message: str) -> bool:
+        text = str(message or "").strip().lower()
+        if not text:
+            return False
+        keywords = (
+            "analyze",
+            "analysis",
+            "cross-reference",
+            "cross reference",
+            "look at",
+            "what were",
+            "show",
+            "compare",
+            "trend",
+            "query",
+            "top",
+            "findings",
+        )
+        return any(token in text for token in keywords)
+
+    @staticmethod
+    def _is_onboarding_control_prompt(message: str) -> bool:
+        text = str(message or "").strip().lower()
+        if not text:
+            return False
+        keywords = (
+            "onboard",
+            "add server",
+            "add mcp",
+            "register",
+            "discover",
+            "mcp server",
+            "bridge",
+            "connect server",
+            "test connection",
+            "server registry",
+        )
+        return any(token in text for token in keywords)
+
+    @classmethod
+    def _collect_turn_grounding_sources(
+        cls,
+        *,
+        tool_events: List[Dict[str, Any]],
+        builtin_tool_events: List[Dict[str, Any]],
+    ) -> Dict[str, List[str]]:
+        mcp_sources: List[str] = []
+        builtin_sources: List[str] = []
+        use_by_id: Dict[str, Dict[str, str]] = {}
+
+        for event in tool_events:
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("type") or "").strip()
+            if event_type != "mcp_tool_use":
+                continue
+            tool_use_id = str(event.get("tool_use_id") or "").strip()
+            if not tool_use_id:
+                continue
+            use_by_id[tool_use_id] = {
+                "tool_name": str(event.get("tool_name") or "").strip(),
+                "server_name": str(event.get("server_name") or "").strip(),
+            }
+
+        for event in tool_events:
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("type") or "").strip()
+            if event_type != "mcp_tool_result":
+                continue
+            if bool(event.get("is_error")):
+                continue
+            tool_use_id = str(event.get("tool_use_id") or "").strip()
+            tool_meta = use_by_id.get(tool_use_id, {})
+            tool_name = str(tool_meta.get("tool_name") or event.get("tool_name") or "").strip()
+            if not tool_name or tool_name in cls.ONBOARDING_CONTROL_TOOLS:
+                continue
+            server_name = str(tool_meta.get("server_name") or event.get("server_name") or "").strip()
+            source = f"{server_name}.{tool_name}" if server_name else tool_name
+            if source and source not in mcp_sources:
+                mcp_sources.append(source)
+
+        builtin_use_by_id: Dict[str, str] = {}
+        for event in builtin_tool_events:
+            if not isinstance(event, dict):
+                continue
+            if str(event.get("type") or "").strip() != "builtin_tool_use":
+                continue
+            tool_use_id = str(event.get("tool_use_id") or "").strip()
+            if not tool_use_id:
+                continue
+            builtin_use_by_id[tool_use_id] = str(event.get("tool_name") or "").strip()
+
+        for event in builtin_tool_events:
+            if not isinstance(event, dict):
+                continue
+            if str(event.get("type") or "").strip() != "builtin_tool_result":
+                continue
+            if bool(event.get("is_error")):
+                continue
+            tool_name = str(event.get("tool_name") or "").strip()
+            if not tool_name:
+                tool_name = builtin_use_by_id.get(str(event.get("tool_use_id") or "").strip(), "")
+            if not tool_name:
+                continue
+            if tool_name not in builtin_sources:
+                builtin_sources.append(tool_name)
+
+        return {"mcp": mcp_sources, "builtin": builtin_sources}
+
+    @staticmethod
+    def _append_grounding_citations(
+        *,
+        text: str,
+        mcp_sources: List[str],
+        builtin_sources: List[str],
+    ) -> str:
+        base = str(text or "").strip()
+        lines: List[str] = [base, "", "Sources used this turn:"]
+        if mcp_sources:
+            lines.append("- MCP: " + ", ".join(mcp_sources))
+        if builtin_sources:
+            lines.append("- Built-in: " + ", ".join(builtin_sources))
+        if not mcp_sources and not builtin_sources:
+            lines.append("- None")
+        return "\n".join(lines).strip()
 
     def run(
         self,
@@ -251,9 +402,43 @@ class AgentRuntime:
                         debug["warnings"].append("agent_sdk_empty_text")
 
                     tool_events = sdk_result.get("tool_events") if isinstance(sdk_result.get("tool_events"), list) else []
+                    builtin_tool_events = (
+                        sdk_result.get("builtin_tool_events")
+                        if isinstance(sdk_result.get("builtin_tool_events"), list)
+                        else []
+                    )
                     policy_violations = self._skill_policy_violations(tool_events, allowed_tool_patterns)
                     if policy_violations:
                         debug["warnings"].append("skill_scope_policy_violation")
+
+                    onboarding_scope = self._is_onboarding_scope(selected_skill_ids)
+                    requires_grounding = onboarding_scope and (
+                        self._visualization_requested(message) or self._is_analysis_or_data_prompt(message)
+                    )
+                    should_skip_grounding_gate = self._is_onboarding_control_prompt(message)
+                    sources = self._collect_turn_grounding_sources(
+                        tool_events=tool_events,
+                        builtin_tool_events=builtin_tool_events,
+                    )
+                    if requires_grounding and (sources["mcp"] or sources["builtin"]):
+                        text = self._append_grounding_citations(
+                            text=text,
+                            mcp_sources=sources["mcp"],
+                            builtin_sources=sources["builtin"],
+                        )
+                    if (
+                        self.onboarding_grounding_enforced
+                        and requires_grounding
+                        and not should_skip_grounding_gate
+                        and not sources["mcp"]
+                        and not sources["builtin"]
+                    ):
+                        text = (
+                            "Grounding requirement not met for this onboarding-session analysis turn. "
+                            "No successful source tool calls were executed this turn. "
+                            "Please retry and I will run the relevant MCP tools first, then cite them."
+                        )
+                        debug["warnings"].append("onboarding_grounding_missing_sources")
 
                     debug["agent_sdk"] = {
                         "response_id": sdk_result.get("response_id"),
@@ -261,6 +446,8 @@ class AgentRuntime:
                         "usage": sdk_result.get("usage"),
                         "server_names": sdk_result.get("server_names"),
                         "tool_events": tool_events,
+                        "builtin_tool_events": builtin_tool_events,
+                        "grounding_sources": sources,
                         "visualizations": (
                             sdk_result.get("visualizations")
                             if isinstance(sdk_result.get("visualizations"), list)

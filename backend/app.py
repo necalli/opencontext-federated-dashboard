@@ -97,12 +97,17 @@ def _collect_tool_progress_events(result: Dict[str, Any]) -> List[Dict[str, Any]
     connector_events = connector.get("tool_events") if isinstance(connector.get("tool_events"), list) else []
     sdk = debug.get("agent_sdk") if isinstance(debug.get("agent_sdk"), dict) else {}
     sdk_events = sdk.get("tool_events") if isinstance(sdk.get("tool_events"), list) else []
+    sdk_builtin_events = (
+        sdk.get("builtin_tool_events")
+        if isinstance(sdk.get("builtin_tool_events"), list)
+        else []
+    )
     sdk_visualizations = (
         sdk.get("visualizations")
         if isinstance(sdk.get("visualizations"), list)
         else []
     )
-    combined_events = list(connector_events) + list(sdk_events)
+    combined_events = list(connector_events) + list(sdk_events) + list(sdk_builtin_events)
     for item in combined_events:
         if not isinstance(item, dict):
             continue
@@ -121,6 +126,26 @@ def _collect_tool_progress_events(result: Dict[str, Any]) -> List[Dict[str, Any]
             events.append(
                 {
                     "phase": "tool_result",
+                    "tool_name": str(item.get("tool_name") or "").strip(),
+                    "tool_use_id": str(item.get("tool_use_id") or "").strip(),
+                    "is_error": bool(item.get("is_error")),
+                    "text_preview": str(item.get("text_preview") or "").strip(),
+                }
+            )
+            continue
+        if event_type == "builtin_tool_use":
+            events.append(
+                {
+                    "phase": "builtin_tool_use",
+                    "tool_name": str(item.get("tool_name") or "").strip(),
+                    "tool_use_id": str(item.get("tool_use_id") or "").strip(),
+                }
+            )
+            continue
+        if event_type == "builtin_tool_result":
+            events.append(
+                {
+                    "phase": "builtin_tool_result",
                     "tool_name": str(item.get("tool_name") or "").strip(),
                     "tool_use_id": str(item.get("tool_use_id") or "").strip(),
                     "is_error": bool(item.get("is_error")),
