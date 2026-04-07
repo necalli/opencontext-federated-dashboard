@@ -289,6 +289,35 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
         self.assertEqual(str(tool_events[1].get("type") or ""), "mcp_tool_result")
         self.assertEqual(str(tool_events[1].get("tool_name") or ""), "mcp_servers_list")
 
+    def test_extract_mcp_init_status_from_system_event_dict(self) -> None:
+        with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
+            runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
+            rows = runtime._extract_mcp_init_status(
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "mcp_servers": [
+                        {"name": "opencontext-main", "status": "connected"},
+                        {"name": "nys-opengov", "status": "failed", "error": {"message": "timeout"}},
+                    ],
+                }
+            )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(str(rows[0].get("name") or ""), "opencontext-main")
+        self.assertEqual(str(rows[1].get("error") or ""), "timeout")
+
+    def test_extract_mcp_init_status_ignores_non_system_event(self) -> None:
+        with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
+            runtime = AnthropicAgentSDKRuntime(server_registry=_FakeRegistry(), tool_router=_FakeToolRouter())
+            rows = runtime._extract_mcp_init_status(
+                {
+                    "type": "assistant",
+                    "subtype": "message",
+                    "mcp_servers": [{"name": "opencontext-main", "status": "connected"}],
+                }
+            )
+        self.assertEqual(rows, [])
+
 
 if __name__ == "__main__":
     unittest.main()

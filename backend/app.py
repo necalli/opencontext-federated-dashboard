@@ -102,6 +102,11 @@ def _collect_tool_progress_events(result: Dict[str, Any]) -> List[Dict[str, Any]
         if isinstance(sdk.get("builtin_tool_events"), list)
         else []
     )
+    sdk_init_status = (
+        sdk.get("mcp_init_status")
+        if isinstance(sdk.get("mcp_init_status"), list)
+        else []
+    )
     sdk_visualizations = (
         sdk.get("visualizations")
         if isinstance(sdk.get("visualizations"), list)
@@ -152,6 +157,17 @@ def _collect_tool_progress_events(result: Dict[str, Any]) -> List[Dict[str, Any]
                     "text_preview": str(item.get("text_preview") or "").strip(),
                 }
             )
+    for item in sdk_init_status:
+        if not isinstance(item, dict):
+            continue
+        events.append(
+            {
+                "phase": "mcp_init",
+                "server_name": str(item.get("name") or "").strip(),
+                "status": str(item.get("status") or "").strip() or "unknown",
+                "error": str(item.get("error") or "").strip(),
+            }
+        )
 
     for artifact in sdk_visualizations:
         if not isinstance(artifact, dict):
