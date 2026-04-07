@@ -19,7 +19,7 @@ class AgentOrchestrator:
         self.registry = registry
         self.skill_registry = SkillPackageRegistry()
         self.runtime = AgentRuntime(
-            agent_sdk_runtime=AnthropicAgentSDKRuntime(),
+            agent_sdk_runtime=AnthropicAgentSDKRuntime(server_registry=registry),
             connector_runtime=AnthropicMCPConnectorRuntime(),
             deterministic_runtime=DeterministicMCPRuntime(),
         )

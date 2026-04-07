@@ -131,6 +131,7 @@ class AnthropicAgentSDKRuntime:
         client_factory: Any | None = None,
         tool_router: ToolRouter | None = None,
         server_registry: ServerRegistryService | None = None,
+        storage: Storage | None = None,
     ) -> None:
         self.api_key = str(os.getenv("ANTHROPIC_API_KEY", "")).strip()
         self.model = str(os.getenv("AGENT_SDK_MODEL", os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"))).strip()
@@ -176,6 +177,11 @@ class AnthropicAgentSDKRuntime:
             os.getenv("AGENT_SDK_MCP_ONBOARD_CONFIRM_REQUIRED", "true"),
             True,
         )
+        self.session_map_persist_enabled = _to_bool(
+            os.getenv("AGENT_SDK_SESSION_MAP_PERSIST_ENABLED", "true"),
+            True,
+        )
+        self.session_map_max_entries = max(1, _to_int(os.getenv("AGENT_SDK_SESSION_MAP_MAX"), 200))
         disallowed_default = (
             "ToolSearch,AskUserQuestion,WebFetch,WebSearch,TodoWrite,NotebookEdit,"
             "TaskOutput,TaskStop,CronCreate,CronDelete,CronList,EnterPlanMode,"
@@ -196,6 +202,8 @@ class AnthropicAgentSDKRuntime:
         self.client_factory = client_factory or OpenContextMCPClient
         self.tool_router = tool_router or ToolRouter(client_factory=self.client_factory)
         self.server_registry = server_registry
+        self.storage = storage or (getattr(server_registry, "storage", None) if server_registry is not None else None)
+        self._load_session_map()
 
     def generate(
         self,
@@ -405,7 +413,7 @@ class AnthropicAgentSDKRuntime:
         sdk_meta = run_result.get("sdk_meta") if isinstance(run_result.get("sdk_meta"), dict) else {}
         sdk_session_id = str(sdk_meta.get("session_id") or run_result.get("response_id") or "").strip()
         if app_session_id and sdk_session_id:
-            self._session_map[app_session_id] = sdk_session_id
+            self._set_sdk_session_mapping(app_session_id=app_session_id, sdk_session_id=sdk_session_id)
         sdk_meta["app_session_id"] = app_session_id
         sdk_meta["resume_applied"] = bool(resume_applied)
         sdk_meta["history_fallback_used"] = bool(history_fallback_used)
@@ -428,6 +436,49 @@ class AnthropicAgentSDKRuntime:
             "visualizations": visualization_artifacts,
             "sdk_meta": sdk_meta,
         }
+
+    def _load_session_map(self) -> None:
+        if not self.session_map_persist_enabled or self.storage is None:
+            return
+        try:
+            rows = self.storage.get_agent_sdk_session_map()
+        except Exception:
+            return
+        if not isinstance(rows, dict):
+            return
+        output: Dict[str, str] = {}
+        for key, value in rows.items():
+            app_session_id = str(key or "").strip()
+            sdk_session_id = str(value or "").strip()
+            if not app_session_id or not sdk_session_id:
+                continue
+            output[app_session_id] = sdk_session_id
+            if len(output) >= self.session_map_max_entries:
+                break
+        self._session_map = output
+
+    def _persist_session_map(self) -> None:
+        if not self.session_map_persist_enabled or self.storage is None:
+            return
+        try:
+            self.storage.save_agent_sdk_session_map(self._session_map)
+        except Exception:
+            return
+
+    def _set_sdk_session_mapping(self, *, app_session_id: str, sdk_session_id: str) -> None:
+        app_key = str(app_session_id or "").strip()
+        sdk_key = str(sdk_session_id or "").strip()
+        if not app_key or not sdk_key:
+            return
+        if app_key in self._session_map:
+            self._session_map.pop(app_key, None)
+        self._session_map[app_key] = sdk_key
+        while len(self._session_map) > self.session_map_max_entries:
+            oldest_key = next(iter(self._session_map), "")
+            if not oldest_key:
+                break
+            self._session_map.pop(oldest_key, None)
+        self._persist_session_map()
 
     def _catalog_tools_for_sdk(
         self,

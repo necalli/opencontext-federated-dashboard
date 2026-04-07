@@ -96,6 +96,19 @@ class _FakeToolRouter:
         return self._Catalog(tools, [])
 
 
+class _FakeStorage:
+    def __init__(self, initial_map=None) -> None:
+        self.map = dict(initial_map or {})
+        self.saved = []
+
+    def get_agent_sdk_session_map(self):
+        return dict(self.map)
+
+    def save_agent_sdk_session_map(self, session_map):
+        self.map = dict(session_map or {})
+        self.saved.append(dict(self.map))
+
+
 class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
     def test_onboarding_tool_names_allowed_when_enabled(self) -> None:
         with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):
@@ -317,6 +330,68 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
                 }
             )
         self.assertEqual(rows, [])
+
+    def test_session_map_loads_from_storage_when_enabled(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_SDK_MCP_ONBOARDING_ENABLED": "true",
+                "AGENT_SDK_SESSION_MAP_PERSIST_ENABLED": "true",
+            },
+            clear=False,
+        ):
+            storage = _FakeStorage({"app-1": "sdk-1"})
+            runtime = AnthropicAgentSDKRuntime(
+                server_registry=_FakeRegistry(),
+                tool_router=_FakeToolRouter(),
+                storage=storage,
+            )
+        self.assertEqual(runtime._session_map.get("app-1"), "sdk-1")
+
+    def test_session_map_persists_updates_and_prunes_by_cap(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_SDK_MCP_ONBOARDING_ENABLED": "true",
+                "AGENT_SDK_SESSION_MAP_PERSIST_ENABLED": "true",
+                "AGENT_SDK_SESSION_MAP_MAX": "2",
+            },
+            clear=False,
+        ):
+            storage = _FakeStorage()
+            runtime = AnthropicAgentSDKRuntime(
+                server_registry=_FakeRegistry(),
+                tool_router=_FakeToolRouter(),
+                storage=storage,
+            )
+            runtime._set_sdk_session_mapping(app_session_id="app-1", sdk_session_id="sdk-1")
+            runtime._set_sdk_session_mapping(app_session_id="app-2", sdk_session_id="sdk-2")
+            runtime._set_sdk_session_mapping(app_session_id="app-3", sdk_session_id="sdk-3")
+        self.assertNotIn("app-1", runtime._session_map)
+        self.assertEqual(runtime._session_map.get("app-2"), "sdk-2")
+        self.assertEqual(runtime._session_map.get("app-3"), "sdk-3")
+        self.assertGreaterEqual(len(storage.saved), 1)
+        self.assertEqual(storage.saved[-1], runtime._session_map)
+
+    def test_session_map_persistence_can_be_disabled(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_SDK_MCP_ONBOARDING_ENABLED": "true",
+                "AGENT_SDK_SESSION_MAP_PERSIST_ENABLED": "false",
+            },
+            clear=False,
+        ):
+            storage = _FakeStorage({"app-1": "sdk-1"})
+            runtime = AnthropicAgentSDKRuntime(
+                server_registry=_FakeRegistry(),
+                tool_router=_FakeToolRouter(),
+                storage=storage,
+            )
+            runtime._set_sdk_session_mapping(app_session_id="app-2", sdk_session_id="sdk-2")
+        self.assertEqual(runtime._session_map.get("app-1"), None)
+        self.assertEqual(runtime._session_map.get("app-2"), "sdk-2")
+        self.assertEqual(storage.saved, [])
 
 
 if __name__ == "__main__":
