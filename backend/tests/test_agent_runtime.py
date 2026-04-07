@@ -308,6 +308,11 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("skills", result["meta"]["debug"])
         self.assertIsInstance(result["meta"]["debug"]["skills"].get("selected_skill_ids"), list)
 
+    def test_default_system_prompt_is_not_hardwired_to_onboarding_mode(self) -> None:
+        registry = StubRegistry(self.servers)
+        orchestrator = AgentOrchestrator(registry=registry)
+        self.assertNotIn("execute the MCP onboarding flow", orchestrator.default_system_prompt.lower())
+
     def test_onboarding_scope_sticky_keeps_tools_for_followup_turn(self) -> None:
         registry = StubRegistry(self.servers)
         orchestrator = AgentOrchestrator(registry=registry)
@@ -371,6 +376,84 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("mcp-server-onboarder", selected_ids)
         self.assertIn("mcp_server_discover", allowed)
         self.assertIn("mcp_server_onboard", allowed)
+
+    def test_onboarding_scope_survives_non_followup_interstitial_turn(self) -> None:
+        registry = StubRegistry(self.servers)
+        orchestrator = AgentOrchestrator(registry=registry)
+        orchestrator.onboarding_scope_sticky_turns = 2
+        orchestrator.onboarding_scope_strict_continuity = True
+        onboarding_package = SkillPackage(
+            skill_id="mcp-server-onboarder",
+            title="mcp-server-onboarder",
+            description="Onboarding workflow",
+            instruction="Use onboarding tools",
+            trigger_keywords=("onboard",),
+            allowed_tool_patterns=("mcp_server_discover", "mcp_server_onboard", "mcp_servers_list"),
+            always_on=False,
+            enabled=True,
+            path="/tmp/skill.md",
+        )
+        orchestrator.skill_registry = StubSkillRegistry(
+            contexts=[
+                {
+                    "selected_skill_ids": ["mcp-server-onboarder"],
+                    "selected_skill_titles": ["mcp-server-onboarder"],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": ["mcp_server_discover"],
+                    "allowed_tool_names": ["mcp_server_discover"],
+                    "system_prompt_addendum": "",
+                },
+                {
+                    "selected_skill_ids": [],
+                    "selected_skill_titles": [],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": [],
+                    "allowed_tool_names": [],
+                    "system_prompt_addendum": "",
+                },
+                {
+                    "selected_skill_ids": [],
+                    "selected_skill_titles": [],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": [],
+                    "allowed_tool_names": [],
+                    "system_prompt_addendum": "",
+                },
+            ],
+            packages=[onboarding_package],
+        )
+        sdk = FakeAgentSDKRuntime(should_fail=False)
+        connector = FakeConnectorRuntime(should_fail=False)
+        deterministic = FakeDeterministicRuntime()
+        orchestrator.runtime = AgentRuntime(
+            agent_sdk_runtime=sdk,
+            connector_runtime=connector,
+            deterministic_runtime=deterministic,
+        )
+
+        orchestrator.run_turn(
+            message="add mcp server",
+            session_id="sticky-3",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+        orchestrator.run_turn(
+            message="what searches did you use?",
+            session_id="sticky-3",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+        third = orchestrator.run_turn(
+            message="let's try another server",
+            session_id="sticky-3",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+
+        selected_ids = third["meta"]["debug"]["skills"]["selected_skill_ids"]
+        allowed = third["meta"]["debug"]["skills"]["allowed_tool_patterns"]
+        self.assertIn("mcp-server-onboarder", selected_ids)
+        self.assertIn("mcp_server_discover", allowed)
 
     def test_onboarding_scope_sticky_can_be_canceled(self) -> None:
         registry = StubRegistry(self.servers)
@@ -446,6 +529,84 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertNotIn("mcp-server-onboarder", cancel["meta"]["debug"]["skills"]["selected_skill_ids"])
         self.assertNotIn("mcp_server_discover", after["meta"]["debug"]["skills"]["allowed_tool_patterns"])
+
+    def test_onboarding_connectivity_claim_guard_requires_current_turn_evidence(self) -> None:
+        class ClaimingSDKRuntime(FakeAgentSDKRuntime):
+            def generate(self, **kwargs):  # type: ignore[override]
+                return {
+                    "text": "All onboarding tools are disconnected right now.",
+                    "response_id": "sdk_claim_test",
+                    "stop_reason": "end_turn",
+                    "usage": {},
+                    "server_names": ["boston-open-data"],
+                    "tool_events": [],
+                    "builtin_tool_events": [],
+                    "visualizations": [],
+                    "mcp_init_status": [],
+                    "sdk_meta": {"session_id": "sdk_claim_test"},
+                }
+
+        runtime = AgentRuntime(
+            agent_sdk_runtime=ClaimingSDKRuntime(),
+            connector_runtime=FakeConnectorRuntime(should_fail=False),
+            deterministic_runtime=FakeDeterministicRuntime(),
+        )
+        result = runtime.run(
+            message="What about Reddit MCPs?",
+            servers=self.servers,
+            history=[],
+            session_id="session-claim-1",
+            prefer_connector=True,
+            system_prompt="test",
+            skill_context={
+                "selected_skill_ids": ["mcp-server-onboarder"],
+                "selected_skill_titles": ["mcp-server-onboarder"],
+                "allowed_tool_patterns": ["mcp_server_discover", "mcp_servers_list"],
+            },
+        )
+        self.assertIn("cannot verify mcp connectivity", str(result.get("message") or "").lower())
+        warnings = result["meta"]["debug"].get("warnings") or []
+        self.assertIn("onboarding_connectivity_claim_without_evidence", warnings)
+
+    def test_onboarding_connectivity_claim_guard_allows_init_status_evidence(self) -> None:
+        class ClaimingSDKRuntime(FakeAgentSDKRuntime):
+            def generate(self, **kwargs):  # type: ignore[override]
+                return {
+                    "text": "All onboarding tools are disconnected right now.",
+                    "response_id": "sdk_claim_test2",
+                    "stop_reason": "end_turn",
+                    "usage": {},
+                    "server_names": ["boston-open-data"],
+                    "tool_events": [],
+                    "builtin_tool_events": [],
+                    "visualizations": [],
+                    "mcp_init_status": [{"name": "opencontext-main", "status": "connected", "error": ""}],
+                    "sdk_meta": {"session_id": "sdk_claim_test2"},
+                }
+
+        runtime = AgentRuntime(
+            agent_sdk_runtime=ClaimingSDKRuntime(),
+            connector_runtime=FakeConnectorRuntime(should_fail=False),
+            deterministic_runtime=FakeDeterministicRuntime(),
+        )
+        result = runtime.run(
+            message="What about Reddit MCPs?",
+            servers=self.servers,
+            history=[],
+            session_id="session-claim-2",
+            prefer_connector=True,
+            system_prompt="test",
+            skill_context={
+                "selected_skill_ids": ["mcp-server-onboarder"],
+                "selected_skill_titles": ["mcp-server-onboarder"],
+                "allowed_tool_patterns": ["mcp_server_discover", "mcp_servers_list"],
+            },
+        )
+        self.assertIn("disconnected", str(result.get("message") or "").lower())
+        agent_debug = result["meta"]["debug"]["agent_sdk"]
+        self.assertEqual(len(agent_debug.get("mcp_init_status") or []), 1)
+        warnings = result["meta"]["debug"].get("warnings") or []
+        self.assertNotIn("onboarding_connectivity_claim_without_evidence", warnings)
 
 
 if __name__ == "__main__":

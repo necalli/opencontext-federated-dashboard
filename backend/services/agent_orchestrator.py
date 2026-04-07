@@ -34,21 +34,29 @@ class AgentOrchestrator:
                     "for New York State / NYS / MTA requests, prefer nys-opengov tools, especially get_data__nys_opengov from data.ny.gov; "
                     "for Boston/CKAN requests, prefer ckan__* tools from opencontext-main. "
                     "Use generic get_data only when alias-specific tools are unavailable. "
-                    "When user asks to add/connect/onboard an MCP server, execute the MCP onboarding flow: "
-                    "convert discovery intent into short search phrases (1-3 words) and call mcp_server_discover one phrase per call; "
-                    "never use sentence-length discovery queries; "
-                    "first discover candidates and recommend options, then wait for explicit user confirmation, "
-                    "if candidate onboarding_mode is stdio_bridge_required, prefer mcp_stdio_bridge_start "
-                    "(auto_onboard=true, confirmed=true) to start bridge and onboard automatically; "
-                    "fallback to mcp_stdio_bridge_plan for manual bridge steps, then onboard local HTTP endpoint; "
-                    "otherwise onboard directly. After onboarding, run MCP connection test, verify tools are listed for that server, "
-                    "and report pass/fail with actionable remediation. "
                     "If user intent is ambiguous across servers, ask a clarifying question before deep analysis."
+                ),
+            )
+        ).strip()
+        self.onboarding_system_prompt_addendum = str(
+            os.getenv(
+                "AGENT_ONBOARDING_SYSTEM_PROMPT_ADDENDUM",
+                (
+                    "Onboarding mode is active. Use MCP onboarding tools to ground every operational claim. "
+                    "Start each onboarding cycle with mcp_servers_list, use mcp_server_discover with short queries, "
+                    "and do not claim tools are disconnected/unavailable unless a current-turn onboarding tool call "
+                    "returns that failure."
                 ),
             )
         ).strip()
         self.sessions: Dict[str, List[Dict[str, Any]]] = {}
         self.onboarding_scope_sticky_turns = max(0, int(os.getenv("AGENT_ONBOARDING_SCOPE_STICKY_TURNS", "6") or 6))
+        self.onboarding_scope_strict_continuity = str(
+            os.getenv("AGENT_ONBOARDING_SCOPE_STRICT_CONTINUITY", "true")
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        self.onboarding_prompt_injection_enabled = str(
+            os.getenv("AGENT_ONBOARDING_PROMPT_INJECTION_ENABLED", "true")
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
         self._onboarding_scope_state: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
@@ -66,6 +74,19 @@ class AgentOrchestrator:
                 "exit onboarding",
                 "done onboarding",
                 "finish onboarding",
+            ],
+        )
+
+    @classmethod
+    def _is_onboarding_complete_intent(cls, prompt: str) -> bool:
+        return cls._contains_phrase(
+            prompt,
+            [
+                "onboarding complete",
+                "onboarding completed",
+                "completed onboarding",
+                "we are done onboarding",
+                "finished onboarding",
             ],
         )
 
@@ -134,19 +155,42 @@ class AgentOrchestrator:
 
         explicit_onboarding = self.ONBOARDING_SKILL_ID in selected_ids
         cancel_intent = self._is_onboarding_cancel_intent(prompt)
+        complete_intent = self._is_onboarding_complete_intent(prompt)
+        followup_intent = self._looks_onboarding_followup(prompt)
         state = self._onboarding_scope_state.get(session_id, {}) if session_id else {}
+        state_active = bool(state.get("active"))
         carry_left = int(state.get("carry_turns_left") or 0)
 
         sticky_active = False
-        if cancel_intent:
+        if cancel_intent or complete_intent:
+            state_active = False
             carry_left = 0
         elif explicit_onboarding:
             sticky_active = True
+            state_active = True
             carry_left = int(self.onboarding_scope_sticky_turns)
-        elif carry_left > 0 and self._looks_onboarding_followup(prompt):
+        elif state_active and carry_left > 0:
+            if self.onboarding_scope_strict_continuity:
+                sticky_active = True
+                if followup_intent:
+                    carry_left = int(self.onboarding_scope_sticky_turns)
+                else:
+                    carry_left = max(0, carry_left - 1)
+                    if carry_left <= 0:
+                        sticky_active = False
+                        state_active = False
+            elif followup_intent:
+                sticky_active = True
+                carry_left = max(0, carry_left - 1)
+            else:
+                state_active = False
+                carry_left = 0
+        elif carry_left > 0 and followup_intent:
             sticky_active = True
+            state_active = True
             carry_left = max(0, carry_left - 1)
         else:
+            state_active = False
             carry_left = 0
 
         if sticky_active:
@@ -180,18 +224,22 @@ class AgentOrchestrator:
 
         if sticky_active:
             addendum = str(scoped.get("system_prompt_addendum") or "").strip()
-            sticky_line = (
+            addendum_lines: List[str] = []
+            if self.onboarding_prompt_injection_enabled and self.onboarding_system_prompt_addendum:
+                addendum_lines.append(self.onboarding_system_prompt_addendum)
+            addendum_lines.append(
                 "Onboarding continuity is active for this session. "
                 "Keep MCP onboarding tools in scope until onboarding is canceled or completed."
             )
-            if sticky_line not in addendum:
-                scoped["system_prompt_addendum"] = (
-                    f"{addendum}\n{sticky_line}".strip() if addendum else sticky_line
-                )
+            merged = addendum
+            for line in addendum_lines:
+                if line and line not in merged:
+                    merged = f"{merged}\n{line}".strip() if merged else line
+            scoped["system_prompt_addendum"] = merged
 
         if session_id:
             self._onboarding_scope_state[session_id] = {
-                "active": bool(sticky_active),
+                "active": bool(sticky_active and carry_left > 0),
                 "carry_turns_left": int(carry_left),
             }
         return scoped

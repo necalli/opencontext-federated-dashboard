@@ -135,6 +135,9 @@ class AgentRuntime:
         self.onboarding_grounding_enforced = str(
             os.getenv("AGENT_ONBOARDING_GROUNDING_ENFORCED", "true")
         ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        self.onboarding_claim_guard_enabled = str(
+            os.getenv("AGENT_ONBOARDING_CLAIM_GUARD_ENABLED", "true")
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
 
     @staticmethod
     def _resolve_runtime_order(
@@ -335,6 +338,37 @@ class AgentRuntime:
             lines.append("- None")
         return "\n".join(lines).strip()
 
+    @staticmethod
+    def _contains_connectivity_claim(text: str) -> bool:
+        value = str(text or "").strip().lower()
+        if not value:
+            return False
+        claim_tokens = (
+            "disconnected",
+            "not connected",
+            "unavailable",
+            "tools unavailable",
+            "registry returning zero",
+            "registry is empty",
+            "non-functional",
+            "no candidates",
+            "0 candidates",
+            "returning zero matches",
+        )
+        return any(token in value for token in claim_tokens)
+
+    @classmethod
+    def _has_onboarding_tool_evidence(cls, tool_events: List[Dict[str, Any]]) -> bool:
+        for event in tool_events:
+            if not isinstance(event, dict):
+                continue
+            if str(event.get("type") or "").strip() != "mcp_tool_use":
+                continue
+            tool_name = str(event.get("tool_name") or "").strip()
+            if tool_name in cls.ONBOARDING_CONTROL_TOOLS:
+                return True
+        return False
+
     def run(
         self,
         *,
@@ -426,6 +460,24 @@ class AgentRuntime:
                             mcp_sources=sources["mcp"],
                             builtin_sources=sources["builtin"],
                         )
+                    mcp_init_status = (
+                        sdk_result.get("mcp_init_status")
+                        if isinstance(sdk_result.get("mcp_init_status"), list)
+                        else []
+                    )
+                    if (
+                        self.onboarding_claim_guard_enabled
+                        and onboarding_scope
+                        and self._contains_connectivity_claim(text)
+                        and not self._has_onboarding_tool_evidence(tool_events)
+                        and not mcp_init_status
+                    ):
+                        text = (
+                            "I cannot verify MCP connectivity from this turn yet. "
+                            "I need to run onboarding checks first (for example mcp_servers_list "
+                            "and/or mcp_server_discover) before making availability claims."
+                        )
+                        debug["warnings"].append("onboarding_connectivity_claim_without_evidence")
                     if (
                         self.onboarding_grounding_enforced
                         and requires_grounding
@@ -447,6 +499,7 @@ class AgentRuntime:
                         "server_names": sdk_result.get("server_names"),
                         "tool_events": tool_events,
                         "builtin_tool_events": builtin_tool_events,
+                        "mcp_init_status": mcp_init_status,
                         "grounding_sources": sources,
                         "visualizations": (
                             sdk_result.get("visualizations")

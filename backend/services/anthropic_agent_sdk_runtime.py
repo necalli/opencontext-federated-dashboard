@@ -420,6 +420,11 @@ class AnthropicAgentSDKRuntime:
             "server_names": [str(row.get("name") or "").strip() for row in active_servers],
             "tool_events": tool_events,
             "builtin_tool_events": builtin_tool_events,
+            "mcp_init_status": (
+                run_result.get("mcp_init_status")
+                if isinstance(run_result.get("mcp_init_status"), list)
+                else []
+            ),
             "visualizations": visualization_artifacts,
             "sdk_meta": sdk_meta,
         }
@@ -3766,10 +3771,31 @@ class AnthropicAgentSDKRuntime:
         usage: Dict[str, Any] = {}
         stop_reason = "end_turn"
         last_stream_text = ""
+        mcp_init_status: List[Dict[str, Any]] = []
+        mcp_init_seen: set[tuple[str, str, str]] = set()
 
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt=message)
             async for event in client.receive_response():
+                for init_status in self._extract_mcp_init_status(event):
+                    if not isinstance(init_status, dict):
+                        continue
+                    key = (
+                        str(init_status.get("name") or "").strip(),
+                        str(init_status.get("status") or "").strip(),
+                        str(init_status.get("error") or "").strip(),
+                    )
+                    if key in mcp_init_seen:
+                        continue
+                    mcp_init_seen.add(key)
+                    mcp_init_status.append(init_status)
+                    self._emit_event(
+                        event_sink,
+                        {
+                            "event": "mcp_init",
+                            "payload": init_status,
+                        },
+                    )
                 for builtin_event in self._extract_builtin_tool_events(event):
                     builtin_tool_events.append(builtin_event)
                     self._emit_event(
@@ -3827,6 +3853,7 @@ class AnthropicAgentSDKRuntime:
             "stop_reason": stop_reason or "end_turn",
             "usage": usage,
             "sdk_meta": sdk_meta,
+            "mcp_init_status": mcp_init_status,
         }
 
     def _extract_builtin_tool_events(self, event: Any) -> List[Dict[str, Any]]:
@@ -3945,6 +3972,69 @@ class AnthropicAgentSDKRuntime:
             "usage": usage if isinstance(usage, dict) else {},
             "stop_reason": stop_reason,
         }
+
+    def _extract_mcp_init_status(self, event: Any) -> List[Dict[str, Any]]:
+        payload: Dict[str, Any] = {}
+        if isinstance(event, dict):
+            payload = dict(event)
+        else:
+            for field in ("type", "subtype", "mcp_servers", "data", "payload"):
+                if hasattr(event, field):
+                    payload[field] = getattr(event, field)
+
+        event_type = str(payload.get("type") or getattr(event, "type", "") or "").strip().lower()
+        if event_type != "system":
+            return []
+        subtype = str(payload.get("subtype") or getattr(event, "subtype", "") or "").strip().lower()
+        if subtype and "init" not in subtype:
+            return []
+
+        rows: Any = payload.get("mcp_servers")
+        if not isinstance(rows, list):
+            data_block = payload.get("data")
+            if isinstance(data_block, dict) and isinstance(data_block.get("mcp_servers"), list):
+                rows = data_block.get("mcp_servers")
+        if not isinstance(rows, list):
+            payload_block = payload.get("payload")
+            if isinstance(payload_block, dict) and isinstance(payload_block.get("mcp_servers"), list):
+                rows = payload_block.get("mcp_servers")
+        if not isinstance(rows, list):
+            return []
+
+        output: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(
+                row.get("name")
+                or row.get("server_name")
+                or row.get("id")
+                or row.get("server")
+                or ""
+            ).strip()
+            status = str(
+                row.get("status")
+                or row.get("state")
+                or row.get("result")
+                or row.get("connection")
+                or "unknown"
+            ).strip()
+            error = row.get("error")
+            error_text = ""
+            if isinstance(error, dict):
+                error_text = str(error.get("message") or error.get("code") or "").strip()
+            elif error:
+                error_text = str(error).strip()
+            if not name and not status and not error_text:
+                continue
+            output.append(
+                {
+                    "name": name,
+                    "status": status or "unknown",
+                    "error": error_text,
+                }
+            )
+        return output
 
     def _tool_result_text(self, result: Any) -> str:
         if isinstance(result, dict):
