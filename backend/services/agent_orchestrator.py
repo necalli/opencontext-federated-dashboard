@@ -19,7 +19,7 @@ class AgentOrchestrator:
         self.registry = registry
         self.skill_registry = SkillPackageRegistry()
         self.runtime = AgentRuntime(
-            agent_sdk_runtime=AnthropicAgentSDKRuntime(),
+            agent_sdk_runtime=AnthropicAgentSDKRuntime(server_registry=registry),
             connector_runtime=AnthropicMCPConnectorRuntime(),
             deterministic_runtime=DeterministicMCPRuntime(),
         )
@@ -259,7 +259,8 @@ class AgentOrchestrator:
 
         current_session_id = str(session_id or "").strip() or str(uuid.uuid4())
         history = list(self.sessions.get(current_session_id, []))
-        servers = [row for row in self.registry.list_servers() if bool(row.get("enabled", True))]
+        all_servers = [row for row in self.registry.list_servers() if isinstance(row, dict)]
+        enabled_servers = [row for row in all_servers if bool(row.get("enabled", True))]
         self.skill_registry.refresh()
         resolved_skill_context = self.skill_registry.resolve_for_message(prompt)
         skill_context = self._apply_onboarding_scope_sticky(
@@ -270,7 +271,7 @@ class AgentOrchestrator:
 
         result = self.runtime.run(
             message=prompt,
-            servers=servers,
+            servers=enabled_servers,
             history=history,
             session_id=current_session_id,
             prefer_connector=prefer_connector,
@@ -292,7 +293,13 @@ class AgentOrchestrator:
         meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
         meta["session_id"] = current_session_id
         meta["history_size"] = len(updated)
-        meta["server_count"] = len(servers)
+        meta["server_count"] = len(enabled_servers)
+        meta["enabled_server_count"] = len(enabled_servers)
+        meta["total_server_count"] = len(all_servers)
+        debug = meta.get("debug") if isinstance(meta.get("debug"), dict) else {}
+        if debug:
+            debug["enabled_server_count"] = len(enabled_servers)
+            debug["total_server_count"] = len(all_servers)
 
         return {
             "message": assistant_message,
