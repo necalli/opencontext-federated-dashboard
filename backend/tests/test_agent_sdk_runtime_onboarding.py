@@ -299,8 +299,10 @@ class AgentSDKRuntimeOnboardingTests(unittest.TestCase):
         self.assertEqual(len(tool_events), 2)
         self.assertEqual(str(tool_events[0].get("type") or ""), "mcp_tool_use")
         self.assertEqual(str(tool_events[0].get("tool_name") or ""), "mcp_servers_list")
+        self.assertTrue(str(tool_events[0].get("input_hash") or "").strip())
         self.assertEqual(str(tool_events[1].get("type") or ""), "mcp_tool_result")
         self.assertEqual(str(tool_events[1].get("tool_name") or ""), "mcp_servers_list")
+        self.assertTrue(str(tool_events[1].get("output_hash") or "").strip())
 
     def test_extract_mcp_init_status_from_system_event_dict(self) -> None:
         with patch.dict(os.environ, {"AGENT_SDK_MCP_ONBOARDING_ENABLED": "true"}, clear=False):

@@ -124,6 +124,9 @@ def _collect_tool_progress_events(result: Dict[str, Any]) -> List[Dict[str, Any]
                     "tool_name": str(item.get("tool_name") or "").strip(),
                     "server_name": str(item.get("server_name") or "").strip(),
                     "tool_use_id": str(item.get("tool_use_id") or "").strip(),
+                    "input_preview": str(item.get("input_preview") or "").strip(),
+                    "input_hash": str(item.get("input_hash") or "").strip(),
+                    "input_chars": int(item.get("input_chars") or 0),
                 }
             )
             continue
@@ -132,9 +135,13 @@ def _collect_tool_progress_events(result: Dict[str, Any]) -> List[Dict[str, Any]
                 {
                     "phase": "tool_result",
                     "tool_name": str(item.get("tool_name") or "").strip(),
+                    "server_name": str(item.get("server_name") or "").strip(),
                     "tool_use_id": str(item.get("tool_use_id") or "").strip(),
                     "is_error": bool(item.get("is_error")),
                     "text_preview": str(item.get("text_preview") or "").strip(),
+                    "output_preview": str(item.get("output_preview") or "").strip(),
+                    "output_hash": str(item.get("output_hash") or "").strip(),
+                    "output_chars": int(item.get("output_chars") or 0),
                 }
             )
             continue
@@ -144,6 +151,9 @@ def _collect_tool_progress_events(result: Dict[str, Any]) -> List[Dict[str, Any]
                     "phase": "builtin_tool_use",
                     "tool_name": str(item.get("tool_name") or "").strip(),
                     "tool_use_id": str(item.get("tool_use_id") or "").strip(),
+                    "input_preview": str(item.get("input_preview") or "").strip(),
+                    "input_hash": str(item.get("input_hash") or "").strip(),
+                    "input_chars": int(item.get("input_chars") or 0),
                 }
             )
             continue
@@ -155,8 +165,55 @@ def _collect_tool_progress_events(result: Dict[str, Any]) -> List[Dict[str, Any]
                     "tool_use_id": str(item.get("tool_use_id") or "").strip(),
                     "is_error": bool(item.get("is_error")),
                     "text_preview": str(item.get("text_preview") or "").strip(),
+                    "output_preview": str(item.get("output_preview") or "").strip(),
+                    "output_hash": str(item.get("output_hash") or "").strip(),
+                    "output_chars": int(item.get("output_chars") or 0),
                 }
             )
+            continue
+    grounding = sdk.get("grounding_evidence") if isinstance(sdk.get("grounding_evidence"), dict) else {}
+    for source in grounding.get("mcp") if isinstance(grounding.get("mcp"), list) else []:
+        if not isinstance(source, dict):
+            continue
+        events.append(
+            {
+                "phase": "grounding_evidence",
+                "source_type": "mcp",
+                "source": str(source.get("source") or "").strip(),
+                "server_name": str(source.get("server_name") or "").strip(),
+                "tool_name": str(source.get("tool_name") or "").strip(),
+                "tool_use_id": str(source.get("tool_use_id") or "").strip(),
+                "input_hash": str(source.get("input_hash") or "").strip(),
+                "output_hash": str(source.get("output_hash") or "").strip(),
+            }
+        )
+    for source in grounding.get("builtin") if isinstance(grounding.get("builtin"), list) else []:
+        if not isinstance(source, dict):
+            continue
+        events.append(
+            {
+                "phase": "grounding_evidence",
+                "source_type": "builtin",
+                "source": str(source.get("source") or "").strip(),
+                "tool_name": str(source.get("tool_name") or "").strip(),
+                "tool_use_id": str(source.get("tool_use_id") or "").strip(),
+                "input_hash": str(source.get("input_hash") or "").strip(),
+                "output_hash": str(source.get("output_hash") or "").strip(),
+            }
+        )
+    citations = sdk.get("grounding_citations") if isinstance(sdk.get("grounding_citations"), dict) else {}
+    if citations:
+        events.append(
+            {
+                "phase": "grounding_citations",
+                "appended": bool(citations.get("appended")),
+                "verified": bool(citations.get("verified")),
+                "mcp_sources": list(citations.get("mcp")) if isinstance(citations.get("mcp"), list) else [],
+                "builtin_sources": list(citations.get("builtin"))
+                if isinstance(citations.get("builtin"), list)
+                else [],
+            }
+        )
     for item in sdk_init_status:
         if not isinstance(item, dict):
             continue
@@ -243,6 +300,8 @@ def _build_run_trace(
                 "fallback_reason": meta.get("fallback_reason"),
                 "history_size": meta.get("history_size"),
                 "server_count": meta.get("server_count"),
+                "enabled_server_count": meta.get("enabled_server_count", meta.get("server_count")),
+                "total_server_count": meta.get("total_server_count", meta.get("server_count")),
             },
             "tool_events": tool_events,
             "errors": [item for item in errors if isinstance(item, dict)],

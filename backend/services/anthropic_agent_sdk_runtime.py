@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import html
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -636,6 +637,7 @@ class AnthropicAgentSDKRuntime:
         async def _wrapped(args: Any) -> Dict[str, Any]:
             tool_input = args if isinstance(args, dict) else {}
             tool_use_id = f"sdktool_{uuid.uuid4().hex[:12]}"
+            input_meta = self._input_observability(tool_input)
             tool_events.append(
                 {
                     "type": "mcp_tool_use",
@@ -643,6 +645,7 @@ class AnthropicAgentSDKRuntime:
                     "server_name": "",
                     "tool_use_id": tool_use_id,
                     "input": dict(tool_input),
+                    **input_meta,
                 }
             )
             self._emit_event(
@@ -654,6 +657,7 @@ class AnthropicAgentSDKRuntime:
                         "tool_name": internal_tool_name,
                         "server_name": "",
                         "tool_use_id": tool_use_id,
+                        **input_meta,
                     },
                 },
             )
@@ -667,13 +671,14 @@ class AnthropicAgentSDKRuntime:
                 )
             except ToolRouterError as exc:
                 text = f"Tool routing failed for {internal_tool_name}: {exc.message}"
+                result_meta = self._output_observability(text)
                 tool_events.append(
                     {
                         "type": "mcp_tool_result",
                         "tool_name": internal_tool_name,
                         "tool_use_id": tool_use_id,
                         "is_error": True,
-                        "text_preview": text[:220],
+                        **result_meta,
                     }
                 )
                 self._emit_event(
@@ -685,7 +690,7 @@ class AnthropicAgentSDKRuntime:
                             "tool_name": internal_tool_name,
                             "tool_use_id": tool_use_id,
                             "is_error": True,
-                            "text_preview": text[:220],
+                            **result_meta,
                         },
                     },
                 )
@@ -699,14 +704,17 @@ class AnthropicAgentSDKRuntime:
                     client.initialize()
                     result = client.tools_call(internal_tool_name, tool_input)
                     text = self._tool_result_text(result.result)
-                    tool_events[-1]["server_name"] = str(server.get("name") or "").strip()
+                    server_name = str(server.get("name") or "").strip()
+                    result_meta = self._output_observability(text)
+                    tool_events[-1]["server_name"] = server_name
                     tool_events.append(
                         {
                             "type": "mcp_tool_result",
                             "tool_name": internal_tool_name,
+                            "server_name": server_name,
                             "tool_use_id": tool_use_id,
                             "is_error": False,
-                            "text_preview": text[:220],
+                            **result_meta,
                         }
                     )
                     self._emit_event(
@@ -716,9 +724,10 @@ class AnthropicAgentSDKRuntime:
                             "payload": {
                                 "phase": "tool_result",
                                 "tool_name": internal_tool_name,
+                                "server_name": server_name,
                                 "tool_use_id": tool_use_id,
                                 "is_error": False,
-                                "text_preview": text[:220],
+                                **result_meta,
                             },
                         },
                     )
@@ -736,13 +745,14 @@ class AnthropicAgentSDKRuntime:
                 f"All MCP server candidates failed for {internal_tool_name}. "
                 f"Attempts: {json.dumps(attempts, ensure_ascii=True)[:500]}"
             )
+            result_meta = self._output_observability(error_text)
             tool_events.append(
                 {
                     "type": "mcp_tool_result",
                     "tool_name": internal_tool_name,
                     "tool_use_id": tool_use_id,
                     "is_error": True,
-                    "text_preview": error_text[:220],
+                    **result_meta,
                 }
             )
             self._emit_event(
@@ -754,7 +764,7 @@ class AnthropicAgentSDKRuntime:
                         "tool_name": internal_tool_name,
                         "tool_use_id": tool_use_id,
                         "is_error": True,
-                        "text_preview": error_text[:220],
+                        **result_meta,
                     },
                 },
             )
@@ -873,6 +883,7 @@ class AnthropicAgentSDKRuntime:
         async def _wrapped(args: Any) -> Dict[str, Any]:
             tool_input = args if isinstance(args, dict) else {}
             tool_use_id = f"sdktool_{uuid.uuid4().hex[:12]}"
+            input_meta = self._input_observability(tool_input)
             tool_events.append(
                 {
                     "type": "mcp_tool_use",
@@ -880,6 +891,7 @@ class AnthropicAgentSDKRuntime:
                     "server_name": "",
                     "tool_use_id": tool_use_id,
                     "input": dict(tool_input),
+                    **input_meta,
                 }
             )
             self._emit_event(
@@ -891,6 +903,7 @@ class AnthropicAgentSDKRuntime:
                         "tool_name": tool_name,
                         "server_name": "",
                         "tool_use_id": tool_use_id,
+                        **input_meta,
                     },
                 },
             )
@@ -901,13 +914,14 @@ class AnthropicAgentSDKRuntime:
                     result = await result
             except Exception as exc:
                 error_text = f"Onboarding tool '{tool_name}' failed: {exc}"
+                result_meta = self._output_observability(error_text)
                 tool_events.append(
                     {
                         "type": "mcp_tool_result",
                         "tool_name": tool_name,
                         "tool_use_id": tool_use_id,
                         "is_error": True,
-                        "text_preview": error_text[:220],
+                        **result_meta,
                     }
                 )
                 self._emit_event(
@@ -919,7 +933,7 @@ class AnthropicAgentSDKRuntime:
                             "tool_name": tool_name,
                             "tool_use_id": tool_use_id,
                             "is_error": True,
-                            "text_preview": error_text[:220],
+                            **result_meta,
                         },
                     },
                 )
@@ -936,13 +950,15 @@ class AnthropicAgentSDKRuntime:
                             text_preview = str(item.get("text") or "").strip()
                             break
 
+            payload_text = text_preview or self._safe_json_text(result)
+            result_meta = self._output_observability(payload_text)
             tool_events.append(
                 {
                     "type": "mcp_tool_result",
                     "tool_name": tool_name,
                     "tool_use_id": tool_use_id,
                     "is_error": is_error,
-                    "text_preview": text_preview[:220],
+                    **result_meta,
                 }
             )
             self._emit_event(
@@ -954,7 +970,7 @@ class AnthropicAgentSDKRuntime:
                         "tool_name": tool_name,
                         "tool_use_id": tool_use_id,
                         "is_error": is_error,
-                        "text_preview": text_preview[:220],
+                        **result_meta,
                     },
                 },
             )
@@ -1014,6 +1030,37 @@ class AnthropicAgentSDKRuntime:
             return json.dumps(payload, ensure_ascii=True, indent=2, default=str)
         except Exception:
             return str(payload)
+
+    @staticmethod
+    def _truncate_text(value: Any, *, limit: int) -> str:
+        text = str(value or "").strip()
+        if len(text) <= int(limit):
+            return text
+        return text[: int(limit)]
+
+    @staticmethod
+    def _hash_text(value: Any) -> str:
+        text = str(value or "")
+        if not text:
+            return ""
+        return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _input_observability(self, payload: Any) -> Dict[str, Any]:
+        raw = self._safe_json_text(payload)
+        return {
+            "input_preview": self._truncate_text(raw, limit=360),
+            "input_hash": self._hash_text(raw),
+            "input_chars": len(raw),
+        }
+
+    def _output_observability(self, text: Any) -> Dict[str, Any]:
+        raw = str(text or "").strip()
+        return {
+            "text_preview": self._truncate_text(raw, limit=220),
+            "output_preview": self._truncate_text(raw, limit=900),
+            "output_hash": self._hash_text(raw),
+            "output_chars": len(raw),
+        }
 
     def _tool_text_response(self, payload: Dict[str, Any], *, is_error: bool) -> Dict[str, Any]:
         return {
@@ -3929,12 +3976,15 @@ class AnthropicAgentSDKRuntime:
                 continue
 
             if block_type == "tool_use":
+                input_payload = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+                input_meta = self._input_observability(input_payload)
                 output.append(
                     {
                         "type": "builtin_tool_use",
                         "tool_name": tool_name,
                         "tool_use_id": str(payload.get("id") or "").strip(),
-                        "input": payload.get("input") if isinstance(payload.get("input"), dict) else {},
+                        "input": input_payload,
+                        **input_meta,
                     }
                 )
                 continue
@@ -3950,13 +4000,14 @@ class AnthropicAgentSDKRuntime:
                     result_text = str(row.get("text") or "").strip()
                     if result_text:
                         break
+            result_meta = self._output_observability(result_text)
             output.append(
                 {
                     "type": "builtin_tool_result",
                     "tool_name": tool_name,
                     "tool_use_id": str(payload.get("tool_use_id") or "").strip(),
                     "is_error": bool(payload.get("is_error", False)),
-                    "text_preview": result_text[:220],
+                    **result_meta,
                     "error": payload.get("error") if isinstance(payload.get("error"), dict) else {},
                 }
             )

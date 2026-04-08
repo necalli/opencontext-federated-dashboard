@@ -281,7 +281,18 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(deterministic.calls, 1)
 
     def test_orchestrator_includes_runtime_debug_metadata(self) -> None:
-        registry = StubRegistry(self.servers)
+        registry = StubRegistry(
+            self.servers
+            + [
+                {
+                    "id": "srv-2",
+                    "name": "disabled-server",
+                    "endpoint": "https://example.org/mcp",
+                    "enabled": False,
+                    "headers": {},
+                }
+            ]
+        )
         orchestrator = AgentOrchestrator(registry=registry)
         sdk = FakeAgentSDKRuntime(should_fail=True)
         connector = FakeConnectorRuntime(should_fail=True)
@@ -304,8 +315,12 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(result["meta"]["fallback_used"])
         self.assertEqual(result["meta"]["fallback_reason"]["code"], "agent_sdk_unavailable")
         self.assertEqual(result["meta"]["server_count"], 1)
+        self.assertEqual(result["meta"]["enabled_server_count"], 1)
+        self.assertEqual(result["meta"]["total_server_count"], 2)
         self.assertGreaterEqual(result["meta"]["history_size"], 2)
         self.assertIn("skills", result["meta"]["debug"])
+        self.assertEqual(result["meta"]["debug"]["enabled_server_count"], 1)
+        self.assertEqual(result["meta"]["debug"]["total_server_count"], 2)
         self.assertIsInstance(result["meta"]["debug"]["skills"].get("selected_skill_ids"), list)
 
     def test_default_system_prompt_is_not_hardwired_to_onboarding_mode(self) -> None:

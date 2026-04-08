@@ -251,15 +251,40 @@ class AgentRuntime:
         return any(token in text for token in keywords)
 
     @classmethod
-    def _collect_turn_grounding_sources(
+    def _grounding_sources_from_evidence(
+        cls,
+        *,
+        evidence: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, List[str]]:
+        mcp_sources: List[str] = []
+        builtin_sources: List[str] = []
+
+        for row in evidence.get("mcp") or []:
+            if not isinstance(row, dict):
+                continue
+            source = str(row.get("source") or "").strip()
+            if source and source not in mcp_sources:
+                mcp_sources.append(source)
+
+        for row in evidence.get("builtin") or []:
+            if not isinstance(row, dict):
+                continue
+            source = str(row.get("source") or "").strip()
+            if source and source not in builtin_sources:
+                builtin_sources.append(source)
+
+        return {"mcp": mcp_sources, "builtin": builtin_sources}
+
+    @classmethod
+    def _collect_turn_grounding_evidence(
         cls,
         *,
         tool_events: List[Dict[str, Any]],
         builtin_tool_events: List[Dict[str, Any]],
-    ) -> Dict[str, List[str]]:
-        mcp_sources: List[str] = []
-        builtin_sources: List[str] = []
-        use_by_id: Dict[str, Dict[str, str]] = {}
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        mcp_evidence: List[Dict[str, Any]] = []
+        builtin_evidence: List[Dict[str, Any]] = []
+        use_by_id: Dict[str, Dict[str, Any]] = {}
 
         for event in tool_events:
             if not isinstance(event, dict):
@@ -273,6 +298,8 @@ class AgentRuntime:
             use_by_id[tool_use_id] = {
                 "tool_name": str(event.get("tool_name") or "").strip(),
                 "server_name": str(event.get("server_name") or "").strip(),
+                "input_hash": str(event.get("input_hash") or "").strip(),
+                "input_preview": str(event.get("input_preview") or "").strip(),
             }
 
         for event in tool_events:
@@ -290,10 +317,21 @@ class AgentRuntime:
                 continue
             server_name = str(tool_meta.get("server_name") or event.get("server_name") or "").strip()
             source = f"{server_name}.{tool_name}" if server_name else tool_name
-            if source and source not in mcp_sources:
-                mcp_sources.append(source)
+            mcp_evidence.append(
+                {
+                    "source": source,
+                    "server_name": server_name,
+                    "tool_name": tool_name,
+                    "tool_use_id": tool_use_id,
+                    "input_hash": str(tool_meta.get("input_hash") or "").strip(),
+                    "input_preview": str(tool_meta.get("input_preview") or "").strip(),
+                    "output_hash": str(event.get("output_hash") or "").strip(),
+                    "output_preview": str(event.get("output_preview") or event.get("text_preview") or "").strip(),
+                    "output_chars": int(event.get("output_chars") or 0),
+                }
+            )
 
-        builtin_use_by_id: Dict[str, str] = {}
+        builtin_use_by_id: Dict[str, Dict[str, Any]] = {}
         for event in builtin_tool_events:
             if not isinstance(event, dict):
                 continue
@@ -302,7 +340,11 @@ class AgentRuntime:
             tool_use_id = str(event.get("tool_use_id") or "").strip()
             if not tool_use_id:
                 continue
-            builtin_use_by_id[tool_use_id] = str(event.get("tool_name") or "").strip()
+            builtin_use_by_id[tool_use_id] = {
+                "tool_name": str(event.get("tool_name") or "").strip(),
+                "input_hash": str(event.get("input_hash") or "").strip(),
+                "input_preview": str(event.get("input_preview") or "").strip(),
+            }
 
         for event in builtin_tool_events:
             if not isinstance(event, dict):
@@ -313,13 +355,41 @@ class AgentRuntime:
                 continue
             tool_name = str(event.get("tool_name") or "").strip()
             if not tool_name:
-                tool_name = builtin_use_by_id.get(str(event.get("tool_use_id") or "").strip(), "")
+                tool_name = str(
+                    (builtin_use_by_id.get(str(event.get("tool_use_id") or "").strip(), {}) or {}).get("tool_name")
+                    or ""
+                ).strip()
             if not tool_name:
                 continue
-            if tool_name not in builtin_sources:
-                builtin_sources.append(tool_name)
+            tool_use_id = str(event.get("tool_use_id") or "").strip()
+            use_meta = builtin_use_by_id.get(tool_use_id, {}) if tool_use_id else {}
+            builtin_evidence.append(
+                {
+                    "source": tool_name,
+                    "tool_name": tool_name,
+                    "tool_use_id": tool_use_id,
+                    "input_hash": str(use_meta.get("input_hash") or "").strip(),
+                    "input_preview": str(use_meta.get("input_preview") or "").strip(),
+                    "output_hash": str(event.get("output_hash") or "").strip(),
+                    "output_preview": str(event.get("output_preview") or event.get("text_preview") or "").strip(),
+                    "output_chars": int(event.get("output_chars") or 0),
+                }
+            )
 
-        return {"mcp": mcp_sources, "builtin": builtin_sources}
+        return {"mcp": mcp_evidence, "builtin": builtin_evidence}
+
+    @classmethod
+    def _collect_turn_grounding_sources(
+        cls,
+        *,
+        tool_events: List[Dict[str, Any]],
+        builtin_tool_events: List[Dict[str, Any]],
+    ) -> Dict[str, List[str]]:
+        evidence = cls._collect_turn_grounding_evidence(
+            tool_events=tool_events,
+            builtin_tool_events=builtin_tool_events,
+        )
+        return cls._grounding_sources_from_evidence(evidence=evidence)
 
     @staticmethod
     def _append_grounding_citations(
@@ -450,16 +520,23 @@ class AgentRuntime:
                         self._visualization_requested(message) or self._is_analysis_or_data_prompt(message)
                     )
                     should_skip_grounding_gate = self._is_onboarding_control_prompt(message)
-                    sources = self._collect_turn_grounding_sources(
+                    grounding_evidence = self._collect_turn_grounding_evidence(
                         tool_events=tool_events,
                         builtin_tool_events=builtin_tool_events,
                     )
+                    sources = self._grounding_sources_from_evidence(
+                        evidence=grounding_evidence,
+                    )
+                    citation_appended = False
                     if requires_grounding and (sources["mcp"] or sources["builtin"]):
                         text = self._append_grounding_citations(
                             text=text,
                             mcp_sources=sources["mcp"],
                             builtin_sources=sources["builtin"],
                         )
+                        citation_appended = True
+                    if requires_grounding and (sources["mcp"] or sources["builtin"]) and not citation_appended:
+                        debug["warnings"].append("onboarding_grounding_citations_not_appended")
                     mcp_init_status = (
                         sdk_result.get("mcp_init_status")
                         if isinstance(sdk_result.get("mcp_init_status"), list)
@@ -501,6 +578,19 @@ class AgentRuntime:
                         "builtin_tool_events": builtin_tool_events,
                         "mcp_init_status": mcp_init_status,
                         "grounding_sources": sources,
+                        "grounding_evidence": grounding_evidence,
+                        "grounding_citations": {
+                            "appended": citation_appended,
+                            "mcp": list(sources["mcp"]),
+                            "builtin": list(sources["builtin"]),
+                            "verified": bool(
+                                not requires_grounding
+                                or citation_appended
+                                or (not sources["mcp"] and not sources["builtin"])
+                            ),
+                        },
+                        "successful_mcp_tool_count": len(grounding_evidence.get("mcp") or []),
+                        "successful_builtin_tool_count": len(grounding_evidence.get("builtin") or []),
                         "visualizations": (
                             sdk_result.get("visualizations")
                             if isinstance(sdk_result.get("visualizations"), list)
@@ -523,6 +613,7 @@ class AgentRuntime:
                             "debug": debug,
                         },
                     }
+
                 except AgentSDKRuntimeError as exc:
                     error_payload = exc.to_dict()
                     debug["errors"].append(error_payload)
