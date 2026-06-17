@@ -106,8 +106,6 @@ class AgentOrchestrator:
                 "onboard",
                 "server",
                 "discover",
-                "search",
-                "query",
                 "candidate",
                 "recommend",
                 "endpoint",
@@ -171,10 +169,15 @@ class AgentOrchestrator:
             carry_left = int(self.onboarding_scope_sticky_turns)
         elif state_active and carry_left > 0:
             if self.onboarding_scope_strict_continuity:
-                sticky_active = True
                 if followup_intent:
+                    sticky_active = True
                     carry_left = int(self.onboarding_scope_sticky_turns)
+                elif selected_ids:
+                    sticky_active = False
+                    state_active = False
+                    carry_left = 0
                 else:
+                    sticky_active = True
                     carry_left = max(0, carry_left - 1)
                     if carry_left <= 0:
                         sticky_active = False

@@ -470,6 +470,91 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("mcp-server-onboarder", selected_ids)
         self.assertIn("mcp_server_discover", allowed)
 
+    def test_onboarding_scope_does_not_hijack_plain_rental_search(self) -> None:
+        registry = StubRegistry(self.servers)
+        orchestrator = AgentOrchestrator(registry=registry)
+        orchestrator.onboarding_scope_sticky_turns = 3
+        onboarding_package = SkillPackage(
+            skill_id="mcp-server-onboarder",
+            title="mcp-server-onboarder",
+            description="Onboarding workflow",
+            instruction="Use onboarding tools",
+            trigger_keywords=("onboard",),
+            allowed_tool_patterns=("mcp_server_discover", "mcp_server_onboard", "mcp_servers_list"),
+            always_on=False,
+            enabled=True,
+            path="/tmp/skill.md",
+        )
+        rental_package = SkillPackage(
+            skill_id="rental_dashboard_ops",
+            title="Rental Dashboard MCP Operations",
+            description="Rental workflow",
+            instruction="Use rental tools",
+            trigger_keywords=("rental", "airbnb", "listing"),
+            allowed_tool_patterns=("search_airbnb_listings", "get_job", "get_search_listings"),
+            always_on=False,
+            enabled=True,
+            path="/tmp/rental.md",
+        )
+        orchestrator.skill_registry = StubSkillRegistry(
+            contexts=[
+                {
+                    "selected_skill_ids": ["mcp-server-onboarder"],
+                    "selected_skill_titles": ["mcp-server-onboarder"],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": ["mcp_server_discover"],
+                    "allowed_tool_names": ["mcp_server_discover"],
+                    "system_prompt_addendum": "",
+                },
+                {
+                    "selected_skill_ids": ["rental_dashboard_ops"],
+                    "selected_skill_titles": ["Rental Dashboard MCP Operations"],
+                    "selected_skills": [
+                        {
+                            "skill_id": "rental_dashboard_ops",
+                            "title": "Rental Dashboard MCP Operations",
+                            "description": "Rental workflow",
+                            "instruction": "Use rental tools",
+                            "tools": ["search_airbnb_listings", "get_job", "get_search_listings"],
+                            "path": "/tmp/rental.md",
+                        }
+                    ],
+                    "allowed_tool_patterns": ["search_airbnb_listings", "get_job", "get_search_listings"],
+                    "allowed_tool_names": ["search_airbnb_listings", "get_job", "get_search_listings"],
+                    "system_prompt_addendum": "",
+                },
+            ],
+            packages=[onboarding_package, rental_package],
+        )
+        sdk = FakeAgentSDKRuntime(should_fail=False)
+        connector = FakeConnectorRuntime(should_fail=False)
+        deterministic = FakeDeterministicRuntime()
+        orchestrator.runtime = AgentRuntime(
+            agent_sdk_runtime=sdk,
+            connector_runtime=connector,
+            deterministic_runtime=deterministic,
+        )
+
+        orchestrator.run_turn(
+            message="add mcp server",
+            session_id="sticky-rental",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+        second = orchestrator.run_turn(
+            message="search rental listings in the Adirondacks NY for 2 people",
+            session_id="sticky-rental",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+
+        selected_ids = second["meta"]["debug"]["skills"]["selected_skill_ids"]
+        allowed = second["meta"]["debug"]["skills"]["allowed_tool_patterns"]
+        self.assertIn("rental_dashboard_ops", selected_ids)
+        self.assertNotIn("mcp-server-onboarder", selected_ids)
+        self.assertIn("search_airbnb_listings", allowed)
+        self.assertNotIn("mcp_server_discover", allowed)
+
     def test_onboarding_scope_sticky_can_be_canceled(self) -> None:
         registry = StubRegistry(self.servers)
         orchestrator = AgentOrchestrator(registry=registry)

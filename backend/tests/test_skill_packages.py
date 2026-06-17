@@ -61,6 +61,15 @@ class SkillPackageTests(unittest.TestCase):
         self.assertIn("mcp-server-onboarder", context["selected_skill_ids"])
         self.assertIn("mcp_server_discover", context["allowed_tool_patterns"])
 
+    def test_resolve_rental_dashboard_ops_for_airbnb_search(self) -> None:
+        context = self.registry.resolve_for_message(
+            "Search rental listings in the Adirondacks NY for 2 people, pet friendly, from 8/10 to 8/14."
+        )
+        self.assertIn("rental_dashboard_ops", context["selected_skill_ids"])
+        self.assertIn("search_airbnb_listings", context["allowed_tool_patterns"])
+        self.assertIn("get_job", context["allowed_tool_patterns"])
+        self.assertIn("get_search_listings", context["allowed_tool_patterns"])
+
 
 if __name__ == "__main__":
     unittest.main()
