@@ -1,0 +1,37 @@
+{
+  "enabled": true,
+  "always_on": false,
+  "tools": [
+    "server_status",
+    "search_airbnb_listings",
+    "import_airbnb_search_url",
+    "ingest_listing_url",
+    "ingest_search_listings",
+    "list_jobs",
+    "get_job",
+    "list_search_runs",
+    "get_search_run",
+    "get_search_listings",
+    "list_ingested_listings",
+    "get_listing",
+    "get_listing_reviews",
+    "get_listing_photos",
+    "export_listing_payload"
+  ],
+  "trigger_keywords": [
+    "rental",
+    "rentals",
+    "airbnb",
+    "listing",
+    "listings",
+    "vacation stay",
+    "stays",
+    "pet friendly",
+    "check-in",
+    "check out",
+    "ingest listing",
+    "search listings",
+    "rental-dashboard",
+    "rental dashboard"
+  ]
+}
