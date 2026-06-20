@@ -68,6 +68,7 @@ class SkillPackageTests(unittest.TestCase):
         self.assertIn("rental_dashboard_ops", context["selected_skill_ids"])
         self.assertIn("search_airbnb_listings", context["allowed_tool_patterns"])
         self.assertIn("get_job", context["allowed_tool_patterns"])
+        self.assertIn("get_jobs", context["allowed_tool_patterns"])
         self.assertIn("get_search_listings", context["allowed_tool_patterns"])
 
 
