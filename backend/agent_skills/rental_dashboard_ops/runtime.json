@@ -9,6 +9,7 @@
     "ingest_search_listings",
     "list_jobs",
     "get_job",
+    "get_jobs",
     "list_search_runs",
     "get_search_run",
     "get_search_listings",

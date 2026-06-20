@@ -555,6 +555,124 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("search_airbnb_listings", allowed)
         self.assertNotIn("mcp_server_discover", allowed)
 
+    def test_rental_scope_resumes_related_followup_without_carrying_other_skills(self) -> None:
+        registry = StubRegistry(self.servers)
+        orchestrator = AgentOrchestrator(registry=registry)
+        rental_package = SkillPackage(
+            skill_id="rental_dashboard_ops",
+            title="Rental Dashboard MCP Operations",
+            description="Rental workflow",
+            instruction="Queue once and poll saved job ids.",
+            trigger_keywords=("rental", "airbnb", "listing"),
+            allowed_tool_patterns=("ingest_search_listings", "get_job", "get_jobs", "get_listing_reviews"),
+            always_on=False,
+            enabled=True,
+            path="/tmp/rental.md",
+        )
+        orchestrator.skill_registry = StubSkillRegistry(
+            contexts=[
+                {
+                    "selected_skill_ids": ["rental_dashboard_ops", "dataset_discovery"],
+                    "selected_skill_titles": ["Rental Dashboard MCP Operations", "Dataset Discovery"],
+                    "selected_skills": [
+                        {
+                            "skill_id": "rental_dashboard_ops",
+                            "title": "Rental Dashboard MCP Operations",
+                            "description": "Rental workflow",
+                            "instruction": "Queue once and poll saved job ids.",
+                            "tools": ["ingest_search_listings", "get_job", "get_jobs", "get_listing_reviews"],
+                            "path": "/tmp/rental.md",
+                        },
+                        {
+                            "skill_id": "dataset_discovery",
+                            "title": "Dataset Discovery",
+                            "description": "Dataset workflow",
+                            "instruction": "Find datasets.",
+                            "tools": ["search_datasets"],
+                            "path": "/tmp/dataset.md",
+                        },
+                    ],
+                    "allowed_tool_patterns": [
+                        "ingest_search_listings",
+                        "get_job",
+                        "get_jobs",
+                        "get_listing_reviews",
+                        "search_datasets",
+                    ],
+                    "allowed_tool_names": [],
+                    "system_prompt_addendum": "Initial mixed context",
+                },
+                {
+                    "selected_skill_ids": [],
+                    "selected_skill_titles": [],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": [],
+                    "allowed_tool_names": [],
+                    "system_prompt_addendum": "",
+                },
+                {
+                    "selected_skill_ids": [],
+                    "selected_skill_titles": [],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": [],
+                    "allowed_tool_names": [],
+                    "system_prompt_addendum": "",
+                },
+                {
+                    "selected_skill_ids": [],
+                    "selected_skill_titles": [],
+                    "selected_skills": [],
+                    "allowed_tool_patterns": [],
+                    "allowed_tool_names": [],
+                    "system_prompt_addendum": "",
+                },
+            ],
+            packages=[rental_package],
+        )
+        sdk = FakeAgentSDKRuntime(should_fail=False)
+        orchestrator.runtime = AgentRuntime(
+            agent_sdk_runtime=sdk,
+            connector_runtime=FakeConnectorRuntime(should_fail=False),
+            deterministic_runtime=FakeDeterministicRuntime(),
+        )
+
+        orchestrator.run_turn(
+            message="Ingest the selected rental listings",
+            session_id="rental-continuation",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+        followup = orchestrator.run_turn(
+            message="Get 20 reviews for each of those listings",
+            session_id="rental-continuation",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+        followup_addendum = str(sdk.last_skill_context.get("system_prompt_addendum") or "")
+        exact_continuation = orchestrator.run_turn(
+            message="Continue",
+            session_id="rental-continuation",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+        unrelated = orchestrator.run_turn(
+            message="Summarize this unrelated paragraph",
+            session_id="rental-continuation",
+            prefer_connector=True,
+            runtime_preference="",
+        )
+
+        followup_skills = followup["meta"]["debug"]["skills"]
+        self.assertEqual(followup_skills["selected_skill_ids"], ["rental_dashboard_ops"])
+        self.assertIn("get_jobs", followup_skills["allowed_tool_patterns"])
+        self.assertNotIn("search_datasets", followup_skills["allowed_tool_patterns"])
+        self.assertIn("do not queue duplicate work", followup_addendum)
+        self.assertEqual(
+            exact_continuation["meta"]["debug"]["skills"]["selected_skill_ids"],
+            ["rental_dashboard_ops"],
+        )
+        self.assertNotIn("rental_dashboard_ops", unrelated["meta"]["debug"]["skills"]["selected_skill_ids"])
+
     def test_onboarding_scope_sticky_can_be_canceled(self) -> None:
         registry = StubRegistry(self.servers)
         orchestrator = AgentOrchestrator(registry=registry)

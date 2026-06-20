@@ -14,6 +14,7 @@ from .skill_packages import SkillPackage, SkillPackageRegistry
 
 class AgentOrchestrator:
     ONBOARDING_SKILL_ID = "mcp-server-onboarder"
+    RENTAL_SKILL_ID = "rental_dashboard_ops"
 
     def __init__(self, registry: ServerRegistryService) -> None:
         self.registry = registry
@@ -58,6 +59,8 @@ class AgentOrchestrator:
             os.getenv("AGENT_ONBOARDING_PROMPT_INJECTION_ENABLED", "true")
         ).strip().lower() in {"1", "true", "yes", "y", "on"}
         self._onboarding_scope_state: Dict[str, Dict[str, Any]] = {}
+        self.rental_scope_sticky_turns = max(0, int(os.getenv("AGENT_RENTAL_SCOPE_STICKY_TURNS", "8") or 8))
+        self._rental_scope_state: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _contains_phrase(prompt: str, phrases: List[str]) -> bool:
@@ -125,6 +128,112 @@ class AgentOrchestrator:
             if str(package.skill_id or "").strip() == target:
                 return package
         return None
+
+    @classmethod
+    def _looks_rental_followup(cls, prompt: str) -> bool:
+        text = re.sub(r"[^a-z0-9\s'-]", " ", str(prompt or "").strip().casefold())
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return False
+        if text in {
+            "continue",
+            "continue please",
+            "keep going",
+            "proceed",
+            "check again",
+            "poll again",
+            "try again",
+            "what is the status",
+            "what's the status",
+            "are they done",
+        }:
+            return True
+        return cls._contains_phrase(
+            text,
+            [
+                "those listings",
+                "these listings",
+                "each listing",
+                "the listings",
+                "the ingest jobs",
+                "those jobs",
+                "job status",
+                "get the reviews",
+                "fetch the reviews",
+                "listing reviews",
+                "listing photos",
+                "listing details",
+                "ingest them",
+                "poll the jobs",
+            ],
+        )
+
+    def _rental_skill_context(self) -> Dict[str, Any] | None:
+        package = self._find_skill_package(self.RENTAL_SKILL_ID)
+        if package is None:
+            return None
+        tools = list(package.allowed_tool_patterns)
+        title = str(package.title or self.RENTAL_SKILL_ID).strip()
+        prompt_lines = [
+            "Active skill packages:",
+            f"- {title}: {package.description or 'Follow rental-dashboard MCP workflow instructions.'}",
+        ]
+        if tools:
+            prompt_lines.append("Tool scope policy: Prefer only these MCP tools unless user explicitly requests broader tooling.")
+            prompt_lines.extend(f"- {tool}" for tool in tools)
+        return {
+            "selected_skill_ids": [self.RENTAL_SKILL_ID],
+            "selected_skill_titles": [title],
+            "selected_skills": [
+                {
+                    "skill_id": self.RENTAL_SKILL_ID,
+                    "title": title,
+                    "description": str(package.description or "").strip(),
+                    "instruction": str(package.instruction or "").strip(),
+                    "tools": tools,
+                    "path": str(package.path or "").strip(),
+                }
+            ],
+            "allowed_tool_patterns": tools,
+            "allowed_tool_names": list(tools),
+            "system_prompt_addendum": "\n".join(prompt_lines).strip(),
+        }
+
+    def _apply_rental_scope_sticky(
+        self,
+        *,
+        session_id: str,
+        prompt: str,
+        skill_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        scoped = dict(skill_context) if isinstance(skill_context, dict) else {}
+        selected_ids = [str(value).strip() for value in (scoped.get("selected_skill_ids") or []) if str(value).strip()]
+        state = self._rental_scope_state.get(session_id, {}) if session_id else {}
+
+        if self.RENTAL_SKILL_ID in selected_ids:
+            if session_id:
+                self._rental_scope_state[session_id] = {"turns_left": self.rental_scope_sticky_turns}
+            return scoped
+
+        if selected_ids or not self._looks_rental_followup(prompt):
+            if session_id:
+                self._rental_scope_state.pop(session_id, None)
+            return scoped
+
+        turns_left = int(state.get("turns_left") or 0)
+        if turns_left <= 0:
+            return scoped
+        rental_context = self._rental_skill_context()
+        if rental_context is None:
+            return scoped
+
+        rental_context["system_prompt_addendum"] = (
+            f"{rental_context.get('system_prompt_addendum', '')}\n"
+            "Rental workflow continuity is active for this session. Resume the saved job ids from conversation history; do not queue duplicate work."
+        ).strip()
+        if session_id:
+            self._rental_scope_state[session_id] = {"turns_left": turns_left - 1}
+        return rental_context
 
     @staticmethod
     def _dedupe(values: List[str]) -> List[str]:
@@ -270,6 +379,11 @@ class AgentOrchestrator:
             session_id=current_session_id,
             prompt=prompt,
             skill_context=resolved_skill_context,
+        )
+        skill_context = self._apply_rental_scope_sticky(
+            session_id=current_session_id,
+            prompt=prompt,
+            skill_context=skill_context,
         )
 
         result = self.runtime.run(
