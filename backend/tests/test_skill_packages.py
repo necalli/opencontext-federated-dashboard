@@ -22,6 +22,36 @@ class SkillPackageTests(unittest.TestCase):
         self.assertIn("analysis_sql", context["selected_skill_ids"])
         self.assertIn("ckan__execute_sql", context["allowed_tool_patterns"])
 
+    def test_resolve_rental_dashboard_skill(self) -> None:
+        context = self.registry.resolve_for_message(
+            "Ingest this Airbnb listing with lite reviews and then show captured reviews."
+        )
+        self.assertIn("rental_dashboard_ops", context["selected_skill_ids"])
+        self.assertIn("ingest_listing_url", context["allowed_tool_patterns"])
+        self.assertIn("get_listing_reviews", context["allowed_tool_patterns"])
+        self.assertNotIn("analysis_sql", context["selected_skill_ids"])
+
+    def test_rental_prompt_does_not_trigger_civic_sql(self) -> None:
+        context = self.registry.resolve_for_message(
+            "Compare these New York Airbnb listings and check their reviews."
+        )
+        self.assertIn("rental_dashboard_ops", context["selected_skill_ids"])
+        self.assertNotIn("analysis_sql", context["selected_skill_ids"])
+
+    def test_open_data_listing_prompt_does_not_trigger_rental_skill(self) -> None:
+        context = self.registry.resolve_for_message(
+            "Find Socrata open data listings for NYC restaurant inspections."
+        )
+        self.assertNotIn("rental_dashboard_ops", context["selected_skill_ids"])
+
+    def test_sticky_followup_preserves_rental_context(self) -> None:
+        context = self.registry.resolve_for_message(
+            "Check status again.",
+            sticky_skill_ids=["rental_dashboard_ops"],
+        )
+        self.assertIn("rental_dashboard_ops", context["selected_skill_ids"])
+        self.assertIn("get_job", context["allowed_tool_patterns"])
+
     def test_empty_message_has_no_skill_scope(self) -> None:
         context = self.registry.resolve_for_message("   ")
         self.assertEqual(context["selected_skill_ids"], [])

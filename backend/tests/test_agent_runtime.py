@@ -3,7 +3,7 @@ from typing import Any, Dict, List
 
 from services.agent_orchestrator import AgentOrchestrator
 from services.agent_runtime import AgentRuntime
-from services.anthropic_agent_sdk_runtime import AgentSDKRuntimeError
+from services.anthropic_agent_sdk_runtime import AgentSDKRuntimeError, AnthropicAgentSDKRuntime
 from services.anthropic_mcp_connector import AnthropicConnectorError
 from services.skill_packages import SkillPackage
 
@@ -150,6 +150,43 @@ class StubSkillRegistry:
             "allowed_tool_names": [],
             "system_prompt_addendum": "",
         }
+
+
+class AnthropicAgentSDKRuntimeWorkflowTests(unittest.TestCase):
+    def test_tool_guidance_marks_empty_reviews_as_local_only(self) -> None:
+        runtime = AnthropicAgentSDKRuntime()
+        guidance = runtime._tool_guidance_text(
+            "get_listing_reviews",
+            {
+                "structuredContent": {
+                    "result": {
+                        "listing_id": "123",
+                        "reviews": [],
+                    }
+                }
+            },
+            "",
+        )
+
+        self.assertIn("currently stored locally", guidance)
+        self.assertIn("capture as incomplete", guidance)
+
+    def test_status_poll_guard_blocks_duplicate_get_job_same_turn(self) -> None:
+        runtime = AnthropicAgentSDKRuntime()
+        guidance = runtime._status_poll_guard_text(
+            tool_name="get_job",
+            tool_input={"job_id": "job-1"},
+            tool_events=[
+                {
+                    "type": "mcp_tool_use",
+                    "tool_name": "get_job",
+                    "input": {"job_id": "job-1"},
+                }
+            ],
+        )
+
+        self.assertIn("already checked", guidance)
+        self.assertIn("Do not poll the same job again", guidance)
 
 
 class AgentRuntimeTests(unittest.TestCase):

@@ -17,9 +17,21 @@
     "count",
     "average",
     "sum",
-    "compare",
-    "nyc",
-    "new york",
+    "civic analysis",
+    "public data",
+    "open data",
     "socrata"
+  ],
+  "negative_keywords": [
+    "airbnb",
+    "rental",
+    "listing",
+    "listings",
+    "ingest",
+    "review",
+    "reviews",
+    "amenities",
+    "booking",
+    "stay"
   ]
 }

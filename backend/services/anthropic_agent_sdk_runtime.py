@@ -661,6 +661,38 @@ class AnthropicAgentSDKRuntime:
                     },
                 },
             )
+            guard_text = self._status_poll_guard_text(
+                tool_name=internal_tool_name,
+                tool_input=tool_input,
+                tool_events=tool_events,
+            )
+            if guard_text:
+                result_meta = self._output_observability(guard_text)
+                tool_events.append(
+                    {
+                        "type": "mcp_tool_result",
+                        "tool_name": internal_tool_name,
+                        "tool_use_id": tool_use_id,
+                        "is_error": False,
+                        "guardrail": "same_turn_status_poll",
+                        **result_meta,
+                    }
+                )
+                self._emit_event(
+                    event_sink,
+                    {
+                        "event": "tool_progress",
+                        "payload": {
+                            "phase": "tool_result",
+                            "tool_name": internal_tool_name,
+                            "tool_use_id": tool_use_id,
+                            "is_error": False,
+                            "guardrail": "same_turn_status_poll",
+                            **result_meta,
+                        },
+                    },
+                )
+                return {"content": [{"type": "text", "text": guard_text}], "is_error": False}
 
             attempts: List[Dict[str, Any]] = []
             try:
@@ -704,6 +736,9 @@ class AnthropicAgentSDKRuntime:
                     client.initialize()
                     result = client.tools_call(internal_tool_name, tool_input)
                     text = self._tool_result_text(result.result)
+                    guidance = self._tool_guidance_text(internal_tool_name, result.result, text)
+                    if guidance:
+                        text = f"{text}\n\nAgent workflow note: {guidance}".strip()
                     server_name = str(server.get("name") or "").strip()
                     result_meta = self._output_observability(text)
                     tool_events[-1]["server_name"] = server_name
@@ -4154,6 +4189,100 @@ class AnthropicAgentSDKRuntime:
         if isinstance(result, list):
             return json.dumps(result, ensure_ascii=True)[:5000]
         return str(result or "").strip() or "Tool completed with empty result."
+
+    @staticmethod
+    def _same_job_id(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+        left_id = str(left.get("job_id") or left.get("id") or "").strip()
+        right_id = str(right.get("job_id") or right.get("id") or "").strip()
+        return bool(left_id and right_id and left_id == right_id)
+
+    def _status_poll_guard_text(
+        self,
+        *,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        tool_events: List[Dict[str, Any]],
+    ) -> str:
+        name = str(tool_name or "").strip()
+        if name == "get_job":
+            for event in tool_events:
+                if str(event.get("type") or "") != "mcp_tool_use":
+                    continue
+                if str(event.get("tool_name") or "") != "get_job":
+                    continue
+                prior_input = event.get("input") if isinstance(event.get("input"), dict) else {}
+                if self._same_job_id(prior_input, tool_input):
+                    job_id = str(tool_input.get("job_id") or "").strip()
+                    return (
+                        f"Job {job_id or 'status'} was already checked in this assistant turn. "
+                        "Do not poll the same job again in this turn; summarize the last status result and ask the user to continue/check again if it is still queued or running."
+                    )
+        if name in {"get_jobs", "list_jobs"}:
+            for event in tool_events:
+                if str(event.get("type") or "") != "mcp_tool_use":
+                    continue
+                if str(event.get("tool_name") or "") == name:
+                    return (
+                        f"{name} was already called in this assistant turn. "
+                        "Use the latest returned job statuses instead of polling again immediately."
+                    )
+        return ""
+
+    def _extract_tool_json_payload(self, result: Any, text: str = "") -> Dict[str, Any]:
+        if isinstance(result, dict):
+            structured = result.get("structuredContent")
+            if isinstance(structured, dict):
+                payload = structured.get("result")
+                if isinstance(payload, dict):
+                    return payload
+            content = result.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("type") or "").strip() != "text":
+                        continue
+                    candidate = str(item.get("text") or "").strip()
+                    if not candidate:
+                        continue
+                    try:
+                        parsed = json.loads(candidate)
+                    except Exception:
+                        continue
+                    if isinstance(parsed, dict):
+                        return parsed
+        if text:
+            try:
+                parsed = json.loads(str(text).strip())
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+        return {}
+
+    def _tool_guidance_text(self, tool_name: str, result: Any, text: str) -> str:
+        name = str(tool_name or "").strip()
+        payload = self._extract_tool_json_payload(result, text)
+        if name == "get_listing_reviews":
+            reviews = payload.get("reviews") if isinstance(payload.get("reviews"), list) else []
+            if not reviews:
+                return (
+                    "An empty review list means no reviews are currently stored locally. "
+                    "If the listing payload or prior job metrics show a positive total review count, describe review capture as incomplete and suggest retrying review capture."
+                )
+        if name == "get_job":
+            job = payload.get("job") if isinstance(payload.get("job"), dict) else payload
+            status = str(job.get("status") or "").strip().lower() if isinstance(job, dict) else ""
+            result_ref = str(job.get("result_ref") or "").strip() if isinstance(job, dict) else ""
+            if status in {"queued", "running"}:
+                return "This job is still processing. Do not restart it; report the job id and ask the user to check again shortly."
+            if status == "complete" and not result_ref:
+                return "This job is complete but has no result_ref. Report that retrieval cannot continue until a result reference is available."
+        if name in {"search_airbnb_listings", "import_airbnb_search_url", "ingest_listing_url", "ingest_search_listings"}:
+            return (
+                "This tool queues asynchronous work. Do not assume listings, reviews, or details are available until get_job reports complete."
+            )
+        return ""
 
     @staticmethod
     def _emit_event(event_sink: Any | None, event: Dict[str, Any]) -> None:

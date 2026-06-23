@@ -34,6 +34,8 @@ class AgentOrchestrator:
                     "for NYC/New York/Socrata requests, prefer nyc-opengov tools, especially get_data__nyc_opengov; "
                     "for New York State / NYS / MTA requests, prefer nys-opengov tools, especially get_data__nys_opengov from data.ny.gov; "
                     "for Boston/CKAN requests, prefer ckan__* tools from opencontext-main. "
+                    "For Airbnb/rental listing searches, listing URL ingests, listing reviews, photos, and rental comparisons, prefer rental-dashboard tools and preserve rental context across short follow-up turns. "
+                    "Do not treat empty local review results as proof Airbnb has no reviews. "
                     "Use generic get_data only when alias-specific tools are unavailable. "
                     "If user intent is ambiguous across servers, ask a clarifying question before deep analysis."
                 ),

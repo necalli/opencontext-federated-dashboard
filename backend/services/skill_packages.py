@@ -25,6 +25,7 @@ class SkillPackage:
     always_on: bool
     enabled: bool
     path: str
+    negative_keywords: Tuple[str, ...] = tuple()
 
 
 def _normalize_text(value: Any) -> str:
@@ -183,6 +184,7 @@ def _load_skill(skill_dir: Path) -> Optional[SkillPackage]:
         keywords = _normalize_keyword_list(frontmatter.get("trigger_keywords"))
     if not keywords:
         keywords = _default_keywords(skill_id, title)
+    negative_keywords = _normalize_keyword_list(runtime.get("negative_keywords"))
 
     return SkillPackage(
         skill_id=skill_id,
@@ -194,6 +196,7 @@ def _load_skill(skill_dir: Path) -> Optional[SkillPackage]:
         always_on=always_on,
         enabled=enabled,
         path=str(skill_file),
+        negative_keywords=tuple(negative_keywords),
     )
 
 
@@ -248,9 +251,20 @@ class SkillPackageRegistry:
         has_action = any(token in value for token in action_tokens)
         return bool(has_mcp_signal and has_action)
 
-    def resolve_for_message(self, message: str, *, max_skills: int = 3) -> Dict[str, Any]:
+    def resolve_for_message(
+        self,
+        message: str,
+        *,
+        max_skills: int = 3,
+        sticky_skill_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         text = _normalize_text(message).lower()
-        if not text:
+        sticky_ids = {
+            str(value or "").strip()
+            for value in (sticky_skill_ids or [])
+            if str(value or "").strip()
+        }
+        if not text and not sticky_ids:
             return {
                 "selected_skill_ids": [],
                 "selected_skill_titles": [],
@@ -275,6 +289,8 @@ class SkillPackageRegistry:
         scored: List[Tuple[int, SkillPackage]] = []
         onboarding_intent = self._is_mcp_onboarding_intent(text)
         for package in active:
+            if any(keyword and keyword in text for keyword in package.negative_keywords):
+                continue
             score = 0
             for keyword in package.trigger_keywords:
                 key = str(keyword or "").strip().lower()
@@ -291,6 +307,10 @@ class SkillPackageRegistry:
         seen = set()
         for package in always_on:
             if package.skill_id not in seen:
+                seen.add(package.skill_id)
+                selected.append(package)
+        for package in active:
+            if package.skill_id in sticky_ids and package.skill_id not in seen:
                 seen.add(package.skill_id)
                 selected.append(package)
         for _, package in scored:
