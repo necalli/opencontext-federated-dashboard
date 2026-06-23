@@ -46,7 +46,8 @@ listing details, listing reviews, listing photos, or rental-dashboard data.
    - Then call `get_search_run` and `get_search_listings`.
 5. For an Airbnb `/rooms/...` listing URL:
    - Call `ingest_listing_url`.
-   - If reviews are requested, pass `include_reviews=true`, prefer `review_mode="lite"` unless the user explicitly asks for full reviews, and keep `review_limit` bounded to the user's request.
+   - If reviews are requested, pass `include_reviews=true` and prefer `review_mode="lite"` unless the user explicitly asks for full reviews.
+   - For lite review capture, pass `review_limit=24` by default. Use a smaller `review_limit` only when the user explicitly asks for a smaller sample.
    - Save the returned job id and poll `get_job`.
    - Then call `get_listing`; use `get_listing_reviews` or `get_listing_photos` only when needed.
 6. When more than one job is queued, save every job id and poll them together with `get_jobs`. Use a short bounded `wait_seconds`; if jobs remain queued or running, report their ids and resume polling on a later user turn.
