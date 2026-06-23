@@ -138,8 +138,8 @@ class ToolApiTests(unittest.TestCase):
         response = self.client.get("/api/v1/mcp/tools/list?server_id=srv-1")
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
-        self.assertEqual(payload["tool_count"], 2)
-        self.assertEqual(len(payload["tools"]), 2)
+        self.assertEqual(payload["tool_count"], 3)
+        self.assertEqual(len(payload["tools"]), 3)
         self.assertTrue(all(row["server_id"] == "srv-1" for row in payload["tools"]))
         self.assertEqual(payload["filters"]["server_id"], "srv-1")
 

@@ -21,11 +21,11 @@ class SkillPackage:
     description: str
     instruction: str
     trigger_keywords: Tuple[str, ...]
-    negative_keywords: Tuple[str, ...]
     allowed_tool_patterns: Tuple[str, ...]
     always_on: bool
     enabled: bool
     path: str
+    negative_keywords: Tuple[str, ...] = tuple()
 
 
 def _normalize_text(value: Any) -> str:
@@ -192,11 +192,11 @@ def _load_skill(skill_dir: Path) -> Optional[SkillPackage]:
         description=description,
         instruction=instruction,
         trigger_keywords=tuple(keywords),
-        negative_keywords=tuple(negative_keywords),
         allowed_tool_patterns=tuple(tools),
         always_on=always_on,
         enabled=enabled,
         path=str(skill_file),
+        negative_keywords=tuple(negative_keywords),
     )
 
 
@@ -224,42 +224,47 @@ class SkillPackageRegistry:
         self.packages = tuple(loaded)
 
     @staticmethod
-    def _is_followup_message(text: str) -> bool:
-        if not text:
+    def _is_mcp_onboarding_intent(text: str) -> bool:
+        value = _normalize_text(text).lower()
+        if not value:
             return False
-        words = text.split()
-        followup_terms = (
-            "continue",
-            "resume",
-            "next",
-            "again",
-            "check",
-            "status",
-            "poll",
-            "job",
-            "result",
-            "results",
-            "reviews",
-            "review",
-            "listing",
-            "listings",
-            "compare",
-            "them",
-            "it",
-            "that",
-            "those",
+
+        # Covers prompts like "add @org/server-mcp" even if "mcp server" is not explicit.
+        has_package_ref = bool(re.search(r"@[a-z0-9][\w.-]*/[\w.-]+", value))
+        has_mcp_signal = "mcp" in value or has_package_ref
+
+        action_tokens = (
+            "add",
+            "onboard",
+            "register",
+            "connect",
+            "integrate",
+            "enable",
+            "disable",
+            "remove",
+            "delete",
+            "test",
+            "verify",
+            "discover",
+            "recommend",
         )
-        return len(words) <= 12 and any(term in text for term in followup_terms)
+        has_action = any(token in value for token in action_tokens)
+        return bool(has_mcp_signal and has_action)
 
     def resolve_for_message(
         self,
         message: str,
         *,
         max_skills: int = 3,
-        sticky_skill_ids: List[str] | None = None,
+        sticky_skill_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         text = _normalize_text(message).lower()
-        if not text:
+        sticky_ids = {
+            str(value or "").strip()
+            for value in (sticky_skill_ids or [])
+            if str(value or "").strip()
+        }
+        if not text and not sticky_ids:
             return {
                 "selected_skill_ids": [],
                 "selected_skill_titles": [],
@@ -282,6 +287,7 @@ class SkillPackageRegistry:
 
         always_on = [item for item in active if item.always_on]
         scored: List[Tuple[int, SkillPackage]] = []
+        onboarding_intent = self._is_mcp_onboarding_intent(text)
         for package in active:
             if any(keyword and keyword in text for keyword in package.negative_keywords):
                 continue
@@ -290,25 +296,21 @@ class SkillPackageRegistry:
                 key = str(keyword or "").strip().lower()
                 if key and key in text:
                     score += 1
+            if onboarding_intent and package.skill_id == "mcp-server-onboarder":
+                # Force onboarding skill into top-N selection for add/register/discover MCP requests.
+                score += 1000
             if score > 0:
                 scored.append((score, package))
-
-        sticky_ids = [str(item or "").strip() for item in (sticky_skill_ids or []) if str(item or "").strip()]
-        if sticky_ids and self._is_followup_message(text):
-            by_id = {package.skill_id: package for package in active}
-            for offset, skill_id in enumerate(sticky_ids):
-                package = by_id.get(skill_id)
-                if package is None:
-                    continue
-                if any(keyword and keyword in text for keyword in package.negative_keywords):
-                    continue
-                scored.append((100 - offset, package))
 
         scored.sort(key=lambda row: (-row[0], row[1].skill_id))
         selected: List[SkillPackage] = []
         seen = set()
         for package in always_on:
             if package.skill_id not in seen:
+                seen.add(package.skill_id)
+                selected.append(package)
+        for package in active:
+            if package.skill_id in sticky_ids and package.skill_id not in seen:
                 seen.add(package.skill_id)
                 selected.append(package)
         for _, package in scored:
