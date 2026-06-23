@@ -665,6 +665,7 @@ class AnthropicAgentSDKRuntime:
                 tool_name=internal_tool_name,
                 tool_input=tool_input,
                 tool_events=tool_events,
+                current_tool_use_id=tool_use_id,
             )
             if guard_text:
                 result_meta = self._output_observability(guard_text)
@@ -4202,10 +4203,14 @@ class AnthropicAgentSDKRuntime:
         tool_name: str,
         tool_input: Dict[str, Any],
         tool_events: List[Dict[str, Any]],
+        current_tool_use_id: str = "",
     ) -> str:
         name = str(tool_name or "").strip()
+        current_id = str(current_tool_use_id or "").strip()
         if name == "get_job":
             for event in tool_events:
+                if current_id and str(event.get("tool_use_id") or "").strip() == current_id:
+                    continue
                 if str(event.get("type") or "") != "mcp_tool_use":
                     continue
                 if str(event.get("tool_name") or "") != "get_job":
@@ -4219,6 +4224,8 @@ class AnthropicAgentSDKRuntime:
                     )
         if name in {"get_jobs", "list_jobs"}:
             for event in tool_events:
+                if current_id and str(event.get("tool_use_id") or "").strip() == current_id:
+                    continue
                 if str(event.get("type") or "") != "mcp_tool_use":
                     continue
                 if str(event.get("tool_name") or "") == name:

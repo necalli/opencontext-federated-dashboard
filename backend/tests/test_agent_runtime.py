@@ -188,6 +188,48 @@ class AnthropicAgentSDKRuntimeWorkflowTests(unittest.TestCase):
         self.assertIn("already checked", guidance)
         self.assertIn("Do not poll the same job again", guidance)
 
+    def test_status_poll_guard_allows_current_get_job_event(self) -> None:
+        runtime = AnthropicAgentSDKRuntime()
+        guidance = runtime._status_poll_guard_text(
+            tool_name="get_job",
+            tool_input={"job_id": "job-1"},
+            current_tool_use_id="current-call",
+            tool_events=[
+                {
+                    "type": "mcp_tool_use",
+                    "tool_name": "get_job",
+                    "tool_use_id": "current-call",
+                    "input": {"job_id": "job-1"},
+                }
+            ],
+        )
+
+        self.assertEqual("", guidance)
+
+    def test_status_poll_guard_blocks_prior_get_job_but_not_current_event(self) -> None:
+        runtime = AnthropicAgentSDKRuntime()
+        guidance = runtime._status_poll_guard_text(
+            tool_name="get_job",
+            tool_input={"job_id": "job-1"},
+            current_tool_use_id="current-call",
+            tool_events=[
+                {
+                    "type": "mcp_tool_use",
+                    "tool_name": "get_job",
+                    "tool_use_id": "prior-call",
+                    "input": {"job_id": "job-1"},
+                },
+                {
+                    "type": "mcp_tool_use",
+                    "tool_name": "get_job",
+                    "tool_use_id": "current-call",
+                    "input": {"job_id": "job-1"},
+                },
+            ],
+        )
+
+        self.assertIn("already checked", guidance)
+
 
 class AgentRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
