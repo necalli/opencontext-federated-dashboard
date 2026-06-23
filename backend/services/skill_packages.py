@@ -21,6 +21,7 @@ class SkillPackage:
     description: str
     instruction: str
     trigger_keywords: Tuple[str, ...]
+    negative_keywords: Tuple[str, ...]
     allowed_tool_patterns: Tuple[str, ...]
     always_on: bool
     enabled: bool
@@ -183,6 +184,7 @@ def _load_skill(skill_dir: Path) -> Optional[SkillPackage]:
         keywords = _normalize_keyword_list(frontmatter.get("trigger_keywords"))
     if not keywords:
         keywords = _default_keywords(skill_id, title)
+    negative_keywords = _normalize_keyword_list(runtime.get("negative_keywords"))
 
     return SkillPackage(
         skill_id=skill_id,
@@ -190,6 +192,7 @@ def _load_skill(skill_dir: Path) -> Optional[SkillPackage]:
         description=description,
         instruction=instruction,
         trigger_keywords=tuple(keywords),
+        negative_keywords=tuple(negative_keywords),
         allowed_tool_patterns=tuple(tools),
         always_on=always_on,
         enabled=enabled,
@@ -220,7 +223,41 @@ class SkillPackageRegistry:
                 loaded.append(skill)
         self.packages = tuple(loaded)
 
-    def resolve_for_message(self, message: str, *, max_skills: int = 3) -> Dict[str, Any]:
+    @staticmethod
+    def _is_followup_message(text: str) -> bool:
+        if not text:
+            return False
+        words = text.split()
+        followup_terms = (
+            "continue",
+            "resume",
+            "next",
+            "again",
+            "check",
+            "status",
+            "poll",
+            "job",
+            "result",
+            "results",
+            "reviews",
+            "review",
+            "listing",
+            "listings",
+            "compare",
+            "them",
+            "it",
+            "that",
+            "those",
+        )
+        return len(words) <= 12 and any(term in text for term in followup_terms)
+
+    def resolve_for_message(
+        self,
+        message: str,
+        *,
+        max_skills: int = 3,
+        sticky_skill_ids: List[str] | None = None,
+    ) -> Dict[str, Any]:
         text = _normalize_text(message).lower()
         if not text:
             return {
@@ -246,6 +283,8 @@ class SkillPackageRegistry:
         always_on = [item for item in active if item.always_on]
         scored: List[Tuple[int, SkillPackage]] = []
         for package in active:
+            if any(keyword and keyword in text for keyword in package.negative_keywords):
+                continue
             score = 0
             for keyword in package.trigger_keywords:
                 key = str(keyword or "").strip().lower()
@@ -253,6 +292,17 @@ class SkillPackageRegistry:
                     score += 1
             if score > 0:
                 scored.append((score, package))
+
+        sticky_ids = [str(item or "").strip() for item in (sticky_skill_ids or []) if str(item or "").strip()]
+        if sticky_ids and self._is_followup_message(text):
+            by_id = {package.skill_id: package for package in active}
+            for offset, skill_id in enumerate(sticky_ids):
+                package = by_id.get(skill_id)
+                if package is None:
+                    continue
+                if any(keyword and keyword in text for keyword in package.negative_keywords):
+                    continue
+                scored.append((100 - offset, package))
 
         scored.sort(key=lambda row: (-row[0], row[1].skill_id))
         selected: List[SkillPackage] = []

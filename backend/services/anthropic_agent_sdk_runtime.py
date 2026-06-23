@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import inspect
 import json
 import os
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -129,6 +130,10 @@ class AnthropicAgentSDKRuntime:
         )
         self.auto_approve_builtins = _parse_csv(os.getenv("AGENT_SDK_AUTO_APPROVE_BUILTINS", ""))
         self.auto_approve_tools_extra = _parse_csv(os.getenv("AGENT_SDK_AUTO_APPROVE_TOOLS", ""))
+        self.duplicate_tool_alias_enabled = _to_bool(
+            os.getenv("AGENT_SDK_DUPLICATE_TOOL_ALIAS_ENABLED", "true"),
+            True,
+        )
         disallowed_default = (
             "ToolSearch,AskUserQuestion,WebFetch,WebSearch,TodoWrite,NotebookEdit,"
             "TaskOutput,TaskStop,CronCreate,CronDelete,CronList,EnterPlanMode,"
@@ -191,7 +196,7 @@ class AnthropicAgentSDKRuntime:
         visualization_requested = self._is_visualization_request(prompt)
 
         catalog = self.tool_router.build_catalog(active_servers)
-        available_tools = self._catalog_tools_by_name(catalog.tools, allowed_patterns)
+        available_tools = self._catalog_tools_for_sdk(catalog.tools, allowed_patterns)
         if not available_tools:
             raise AgentSDKRuntimeError(
                 "no_tools",
@@ -224,7 +229,9 @@ class AnthropicAgentSDKRuntime:
             viz_allowed_name = f"mcp__{self.server_alias}__create_visualization"
             if viz_allowed_name not in allowed_tool_names:
                 allowed_tool_names.append(viz_allowed_name)
-            internal_to_allowed["create_visualization"] = viz_allowed_name
+            internal_to_allowed.setdefault("create_visualization", [])
+            if viz_allowed_name not in internal_to_allowed["create_visualization"]:
+                internal_to_allowed["create_visualization"].append(viz_allowed_name)
 
         subagents = self._build_subagents(
             selected_skills=selected_skills,
@@ -345,12 +352,12 @@ class AnthropicAgentSDKRuntime:
             "sdk_meta": sdk_meta,
         }
 
-    def _catalog_tools_by_name(
+    def _catalog_tools_for_sdk(
         self,
         tools: List[Dict[str, Any]],
         allowed_patterns: List[str],
-    ) -> Dict[str, Dict[str, Any]]:
-        output: Dict[str, Dict[str, Any]] = {}
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
         for item in tools:
             if not isinstance(item, dict):
                 continue
@@ -359,28 +366,89 @@ class AnthropicAgentSDKRuntime:
                 continue
             if allowed_patterns and not tool_allowed(tool_name, allowed_patterns):
                 continue
-            if tool_name not in output:
-                output[tool_name] = item
+            normalized.append(
+                {
+                    "sdk_name": tool_name,
+                    "internal_tool_name": tool_name,
+                    "server_id": str(item.get("server_id") or "").strip(),
+                    "server_name": str(item.get("server_name") or "").strip(),
+                    "description": str(item.get("description") or "").strip(),
+                    "input_schema": item.get("input_schema") if isinstance(item.get("input_schema"), dict) else {},
+                }
+            )
+
+        if not self.duplicate_tool_alias_enabled:
+            deduped: Dict[str, Dict[str, Any]] = {}
+            for row in normalized:
+                tool_name = str(row.get("internal_tool_name") or "").strip()
+                if tool_name and tool_name not in deduped:
+                    deduped[tool_name] = row
+            return list(deduped.values())
+
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in normalized:
+            tool_name = str(row.get("internal_tool_name") or "").strip()
+            if not tool_name:
+                continue
+            grouped.setdefault(tool_name, []).append(row)
+
+        output: List[Dict[str, Any]] = []
+        for tool_name in sorted(grouped.keys()):
+            group = grouped.get(tool_name) or []
+            if len(group) <= 1:
+                if group:
+                    output.append(group[0])
+                continue
+
+            used_sdk_names: set[str] = set()
+            for index, row in enumerate(group, start=1):
+                server_hint = (
+                    str(row.get("server_name") or "").strip()
+                    or str(row.get("server_id") or "").strip()
+                    or f"server_{index}"
+                )
+                slug = re.sub(r"[^a-z0-9]+", "_", server_hint.lower()).strip("_")
+                if not slug:
+                    slug = f"server_{index}"
+                slug = slug[:48]
+
+                sdk_name = f"{tool_name}__{slug}"
+                counter = 2
+                while sdk_name in used_sdk_names:
+                    sdk_name = f"{tool_name}__{slug}_{counter}"
+                    counter += 1
+                used_sdk_names.add(sdk_name)
+
+                aliased = dict(row)
+                aliased["sdk_name"] = sdk_name
+                output.append(aliased)
+
+        output.sort(key=lambda row: str(row.get("sdk_name") or "").strip())
         return output
 
     def _build_wrapped_tools(
         self,
         *,
-        available_tools: Dict[str, Dict[str, Any]],
+        available_tools: List[Dict[str, Any]],
         active_servers: List[Dict[str, Any]],
         tool_events: List[Dict[str, Any]],
         event_sink: Any | None = None,
-    ) -> Tuple[List[Any], List[str], Dict[str, str]]:
+    ) -> Tuple[List[Any], List[str], Dict[str, List[str]]]:
         wrapped: List[Any] = []
         allowed_tools: List[str] = []
-        internal_to_allowed: Dict[str, str] = {}
+        internal_to_allowed: Dict[str, List[str]] = {}
 
-        for tool_name, tool_def in sorted(available_tools.items(), key=lambda row: row[0]):
-            description = str(tool_def.get("description") or "").strip() or f"Execute {tool_name}"
+        for tool_def in available_tools:
+            sdk_name = str(tool_def.get("sdk_name") or "").strip()
+            internal_tool_name = str(tool_def.get("internal_tool_name") or "").strip()
+            if not sdk_name or not internal_tool_name:
+                continue
+
+            description = str(tool_def.get("description") or "").strip() or f"Execute {internal_tool_name}"
             source_server = str(tool_def.get("server_name") or "").strip()
             if source_server:
                 description = f"[Source server: {source_server}] {description}".strip()
-            if tool_name == "get_data" and source_server:
+            if internal_tool_name == "get_data" and source_server:
                 lowered = source_server.lower()
                 if "nys" in lowered or "new york state" in lowered or "mta" in lowered:
                     description = (
@@ -398,8 +466,13 @@ class AnthropicAgentSDKRuntime:
 
             wrapped.append(
                 self._tool_factory(
-                    sdk_name=tool_name,
-                    internal_tool_name=tool_name,
+                    sdk_name=sdk_name,
+                    internal_tool_name=internal_tool_name,
+                    preferred_server_id=(
+                        str(tool_def.get("server_id") or "").strip()
+                        if self.duplicate_tool_alias_enabled
+                        else ""
+                    ),
                     description=description,
                     input_schema=input_schema,
                     active_servers=active_servers,
@@ -408,9 +481,14 @@ class AnthropicAgentSDKRuntime:
                 )
             )
 
-            allowed_name = f"mcp__{self.server_alias}__{tool_name}"
+            allowed_name = f"mcp__{self.server_alias}__{sdk_name}"
             allowed_tools.append(allowed_name)
-            internal_to_allowed[tool_name] = allowed_name
+            internal_to_allowed.setdefault(internal_tool_name, [])
+            if allowed_name not in internal_to_allowed[internal_tool_name]:
+                internal_to_allowed[internal_tool_name].append(allowed_name)
+            internal_to_allowed.setdefault(sdk_name, [])
+            if allowed_name not in internal_to_allowed[sdk_name]:
+                internal_to_allowed[sdk_name].append(allowed_name)
 
         return wrapped, allowed_tools, internal_to_allowed
 
@@ -419,6 +497,7 @@ class AnthropicAgentSDKRuntime:
         *,
         sdk_name: str,
         internal_tool_name: str,
+        preferred_server_id: str,
         description: str,
         input_schema: Dict[str, Any],
         active_servers: List[Dict[str, Any]],
@@ -429,6 +508,33 @@ class AnthropicAgentSDKRuntime:
         async def _wrapped(args: Any) -> Dict[str, Any]:
             tool_input = args if isinstance(args, dict) else {}
             tool_use_id = f"sdktool_{uuid.uuid4().hex[:12]}"
+            guard_text = self._status_poll_guard_text(
+                tool_name=internal_tool_name,
+                tool_input=tool_input,
+                tool_events=tool_events,
+            )
+            if guard_text:
+                tool_events.append(
+                    {
+                        "type": "mcp_tool_use",
+                        "tool_name": internal_tool_name,
+                        "server_name": "",
+                        "tool_use_id": tool_use_id,
+                        "input": dict(tool_input),
+                        "blocked_by_guard": True,
+                    }
+                )
+                tool_events.append(
+                    {
+                        "type": "mcp_tool_result",
+                        "tool_name": internal_tool_name,
+                        "tool_use_id": tool_use_id,
+                        "is_error": False,
+                        "text_preview": guard_text[:220],
+                        "guardrail": "same_turn_status_poll",
+                    }
+                )
+                return {"content": [{"type": "text", "text": guard_text}], "is_error": False}
             tool_events.append(
                 {
                     "type": "mcp_tool_use",
@@ -456,6 +562,7 @@ class AnthropicAgentSDKRuntime:
                 candidates, _ = self.tool_router.route_candidates(
                     tool_name=internal_tool_name,
                     servers=active_servers,
+                    preferred_server_id=preferred_server_id,
                 )
             except ToolRouterError as exc:
                 text = f"Tool routing failed for {internal_tool_name}: {exc.message}"
@@ -491,6 +598,9 @@ class AnthropicAgentSDKRuntime:
                     client.initialize()
                     result = client.tools_call(internal_tool_name, tool_input)
                     text = self._tool_result_text(result.result)
+                    guidance = self._tool_guidance_text(internal_tool_name, result.result, text)
+                    if guidance:
+                        text = f"{text}\n\nAgent workflow note: {guidance}".strip()
                     tool_events[-1]["server_name"] = str(server.get("name") or "").strip()
                     tool_events.append(
                         {
@@ -554,11 +664,49 @@ class AnthropicAgentSDKRuntime:
 
         return _wrapped
 
+    @staticmethod
+    def _same_job_id(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+        left_id = str(left.get("job_id") or "").strip()
+        right_id = str(right.get("job_id") or "").strip()
+        return bool(left_id and right_id and left_id == right_id)
+
+    def _status_poll_guard_text(
+        self,
+        *,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        tool_events: List[Dict[str, Any]],
+    ) -> str:
+        name = str(tool_name or "").strip()
+        if name == "get_job":
+            for event in tool_events:
+                if str(event.get("type") or "") != "mcp_tool_use":
+                    continue
+                if str(event.get("tool_name") or "") != "get_job":
+                    continue
+                prior_input = event.get("input") if isinstance(event.get("input"), dict) else {}
+                if self._same_job_id(prior_input, tool_input):
+                    job_id = str(tool_input.get("job_id") or "").strip()
+                    return (
+                        f"Status for job {job_id} was already checked during this response. "
+                        "Do not poll the same job again in this turn; summarize the last status result and ask the user to continue/check again if it is still queued or running."
+                    )
+        if name in {"get_jobs", "list_jobs"}:
+            for event in tool_events:
+                if str(event.get("type") or "") != "mcp_tool_use":
+                    continue
+                if str(event.get("tool_name") or "") == name:
+                    return (
+                        f"{name} was already called during this response. "
+                        "Do not repeat broad job polling in the same turn; summarize what is known and ask the user to continue/check again if needed."
+                    )
+        return ""
+
     def _build_subagents(
         self,
         *,
         selected_skills: List[Dict[str, Any]],
-        internal_to_allowed: Dict[str, str],
+        internal_to_allowed: Dict[str, List[str]],
     ) -> Dict[str, Any]:
         output: Dict[str, Any] = {}
         for item in selected_skills:
@@ -571,8 +719,14 @@ class AnthropicAgentSDKRuntime:
             description = str(item.get("description") or "").strip() or f"Specialist for {title}"
             instruction = str(item.get("instruction") or "").strip()
             tool_names = item.get("tools") if isinstance(item.get("tools"), list) else []
-            allowed = [internal_to_allowed.get(str(name or "").strip(), "") for name in tool_names]
-            allowed = [name for name in allowed if name]
+            allowed: List[str] = []
+            for name in tool_names:
+                mapped = internal_to_allowed.get(str(name or "").strip(), [])
+                mapped_values = [mapped] if isinstance(mapped, str) else list(mapped)
+                for allowed_name in mapped_values:
+                    value = str(allowed_name or "").strip()
+                    if value and value not in allowed:
+                        allowed.append(value)
             if not allowed:
                 continue
 
@@ -1157,6 +1311,71 @@ class AnthropicAgentSDKRuntime:
         if isinstance(result, list):
             return json.dumps(result, ensure_ascii=True)[:5000]
         return str(result or "").strip() or "Tool completed with empty result."
+
+    def _extract_tool_json_payload(self, result: Any, text: str = "") -> Dict[str, Any]:
+        if isinstance(result, dict):
+            structured = result.get("structuredContent")
+            if isinstance(structured, dict):
+                payload = structured.get("result")
+                if isinstance(payload, dict):
+                    return payload
+                if isinstance(structured, dict):
+                    return structured
+            if "content" not in result:
+                return result
+            content = result.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("type") or "").strip() != "text":
+                        continue
+                    candidate = str(item.get("text") or "").strip()
+                    if not candidate:
+                        continue
+                    try:
+                        parsed = json.loads(candidate)
+                    except Exception:
+                        continue
+                    if isinstance(parsed, dict):
+                        return parsed
+        candidate_text = str(text or "").strip()
+        if candidate_text.startswith("{"):
+            try:
+                parsed = json.loads(candidate_text)
+            except Exception:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    def _tool_guidance_text(self, tool_name: str, result: Any, text: str) -> str:
+        name = str(tool_name or "").strip()
+        payload = self._extract_tool_json_payload(result, text)
+        if name == "get_listing_reviews":
+            reviews = payload.get("reviews") if isinstance(payload.get("reviews"), list) else []
+            if not reviews:
+                return (
+                    "get_listing_reviews returned no locally stored review rows. This is not proof that Airbnb has no reviews. "
+                    "If the listing payload or prior job metrics show a positive total review count, describe review capture as incomplete and suggest retrying review capture."
+                )
+        if name == "get_job":
+            job = payload.get("job") if isinstance(payload.get("job"), dict) else payload
+            status = str(job.get("status") or "").strip().lower() if isinstance(job, dict) else ""
+            result_ref = str(job.get("result_ref") or "").strip() if isinstance(job, dict) else ""
+            if status in {"queued", "running"}:
+                return (
+                    f"The job is {status}. Do not poll repeatedly in this response; tell the user it is still processing and ask them to continue/check again shortly."
+                )
+            if status == "complete" and result_ref:
+                return (
+                    "The job completed. Use result_ref with the appropriate retrieval tool before drawing conclusions: "
+                    "get_search_run/get_search_listings for search jobs, or get_listing/get_listing_reviews for listing ingest jobs."
+                )
+        if name in {"search_airbnb_listings", "import_airbnb_search_url", "ingest_listing_url", "ingest_search_listings"}:
+            return (
+                "This tool queues asynchronous work. Do not assume listings/reviews/details are available until get_job reports complete."
+            )
+        return ""
 
     @staticmethod
     def _emit_event(event_sink: Any | None, event: Dict[str, Any]) -> None:

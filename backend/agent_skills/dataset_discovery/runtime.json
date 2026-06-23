@@ -9,7 +9,6 @@
   "trigger_keywords": [
     "dataset",
     "datasets",
-    "search",
     "discover",
     "find data",
     "open data",
@@ -20,5 +19,17 @@
     "nyc",
     "new york",
     "socrata"
+  ],
+  "negative_keywords": [
+    "airbnb",
+    "rental",
+    "listing",
+    "listings",
+    "ingest",
+    "review",
+    "reviews",
+    "amenities",
+    "booking",
+    "stay"
   ]
 }
